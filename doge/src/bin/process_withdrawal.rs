@@ -435,7 +435,7 @@ async fn run(args: Args) -> Result<()> {
     let noop = find_noop_message(&monitor, &process_signature).await?;
     if noop.emitter != expected_bridge_state { bail!("noop emitter mismatch"); }
     if noop.payer != payer.pubkey() { bail!("noop payer mismatch"); }
-    if noop.consistency_level != 1 { bail!("noop consistency level {}", noop.consistency_level); }
+    if noop.consistency_level != 32 { bail!("noop consistency level {}", noop.consistency_level); }
     if noop.sighash != sighash { bail!("noop sighash mismatch"); }
     if noop.doge_tx_bytes != raw_bytes { bail!("noop doge_tx_bytes mismatch"); }
 
