@@ -1,0 +1,29 @@
+[package]
+name = "doge-bridge-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool for managing the Doge Bridge on Solana"
+
+[dependencies]
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+spl-token = { workspace = true }
+spl-associated-token-account = { workspace = true }
+
+psy-bridge-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", features = ["serialize_bytemuck", "serialize_serde", "sha2"] }
+psy-doge-solana-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", features = ["serialize_bytemuck", "serialize_serde", "fake_signer"] }
+doge-bridge-client = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet" }
+
+[[bin]]
+name = "doge-bridge-cli"
+path = "src/main.rs"
+
+[[example]]
+name = "e2e_bridge_client"
+path = "examples/e2e_bridge_client.rs"

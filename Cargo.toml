@@ -1,0 +1,20 @@
+[workspace]
+members = ["cli", "doge"]
+resolver = "2"
+
+[workspace.dependencies]
+solana-sdk = "=2.2.1"
+solana-client = "=2.2.1"
+solana-transaction-status = "=2.2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+tokio = { version = "1.43", features = ["full"] }
+anyhow = "1.0"
+hex = "0.4"
+bytemuck = "1.24"
+clap = { version = "4.5", features = ["derive"] }
+spl-token = "=4.0"
+spl-associated-token-account = "=4.0"
+
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/anza-xyz/curve25519-dalek.git", rev = "b500cdc2a920cd5bff9e2dd974d7b97349d61464" }
