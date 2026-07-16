@@ -352,17 +352,36 @@ struct Evidence {
     custody: Value,
 }
 
+const OFFICIAL_TESTNET_MANAGER_SET_1_HEX: &str = concat!(
+    "010507",
+    "02349de56ca5dd06db8660419d6f150662e0f04febdbf6512d7cfe78c23b51491c",
+    "035163bfd9518b0a536a17f330a1589fe21d7404b51f525a0a990a65a701952ebb",
+    "036d40b0b85bca49e41f05a26950578bb13a424507ce34a80f83d3cf601e25818b",
+    "0307681002ae28b9399e828d0f46d54c31d5d6ff187b3bdddc6615987a466455f5",
+    "0375abc8955c8a8c875ee1febd157132adcc1b992d69a946e83485b8360e23a277",
+    "030212d206546216917a75533ed6c975f8f794ba0d8a7fb84dedf65ebb20e64841",
+    "037ff483369b52bd87a73f23413dd8fcace71de7f7823c5c9120f1e9cfe5733a88",
+);
+
+fn manager_set_for_index(index: u32) -> Result<ManagerSet> {
+    match index {
+        0 => Ok(local_regtest_manager_set()),
+        1 => ManagerSet::parse(
+            &hex::decode(OFFICIAL_TESTNET_MANAGER_SET_1_HEX)
+                .context("decode official testnet manager set 1")?,
+        ),
+        _ => bail!("unsupported manager set index {index}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     run(Args::parse()).await
 }
 
 async fn run(args: Args) -> Result<()> {
-    if args.manager_set_index != 0 {
-        bail!(
-            "local manager service only supports deterministic manager set index 0, got {}",
-            args.manager_set_index
-        );
+    if args.manager_set_index > 1 {
+        bail!("unsupported manager set index {}", args.manager_set_index);
     }
 
     let bridge_state_pda = Pubkey::find_program_address(
@@ -418,9 +437,10 @@ async fn run(args: Args) -> Result<()> {
     if fee.amount_after_fees == 0 {
         bail!("withdrawal amount after fees is zero");
     }
-    let recipient_address = args
-        .network
-        .encode_address(selected.record.address_type, selected.record.recipient_address)?;
+    let recipient_address = args.network.encode_address(
+        selected.record.address_type,
+        selected.record.recipient_address,
+    )?;
 
     store.upsert_withdrawal_request(&store_request(
         &selected,
@@ -484,7 +504,7 @@ async fn run(args: Args) -> Result<()> {
         error
     })?;
 
-    let manager_set = local_regtest_manager_set();
+    let manager_set = manager_set_for_index(args.manager_set_index)?;
     let prepared = build_prepared_transaction(
         args.network,
         &selected,
@@ -615,13 +635,10 @@ async fn run(args: Args) -> Result<()> {
         .await
         .context("submit authorize_withdrawal")?
     };
-    let authorize_meta = wait_for_transaction_meta(
-        &solana_rpc,
-        &authorize_signature,
-        Duration::from_secs(30),
-    )
-    .await
-    .context("fetch authorize_withdrawal transaction")?;
+    let authorize_meta =
+        wait_for_transaction_meta(&solana_rpc, &authorize_signature, Duration::from_secs(30))
+            .await
+            .context("fetch authorize_withdrawal transaction")?;
 
     // Verify the bridge state was not mutated by authorization (only the
     // active intent hash and pending PDA should change).
@@ -960,13 +977,10 @@ async fn run(args: Args) -> Result<()> {
     let finalize_signature = send_solana_transaction(&solana_rpc, &payer, &[finalize_ix], &[])
         .await
         .context("submit permissionless finalize_confirmed_withdrawal discriminator 17")?;
-    let finalize_meta = wait_for_transaction_meta(
-        &solana_rpc,
-        &finalize_signature,
-        Duration::from_secs(30),
-    )
-    .await
-    .context("fetch finalize_confirmed_withdrawal transaction")?;
+    let finalize_meta =
+        wait_for_transaction_meta(&solana_rpc, &finalize_signature, Duration::from_secs(30))
+            .await
+            .context("fetch finalize_confirmed_withdrawal transaction")?;
 
     let finalized_state = bridge_client
         .get_current_bridge_state()
@@ -1864,14 +1878,16 @@ async fn confirm_withdrawal(
                 .to_owned();
             doge.call("generatetoaddress", json!([mine_blocks, mining_address]))
                 .await?;
-            let verbose = wait_for_doge_confirmation(doge, txid, minimum, timeout, interval).await?;
+            let verbose =
+                wait_for_doge_confirmation(doge, txid, minimum, timeout, interval).await?;
             let raw_hex = doge
                 .call("getrawtransaction", json!([txid, false]))
                 .await?
                 .as_str()
                 .ok_or_else(|| anyhow!("getrawtransaction result is not hex"))?
                 .to_owned();
-            let raw_bytes = hex::decode(raw_hex).context("decode confirmed raw Dogecoin transaction")?;
+            let raw_bytes =
+                hex::decode(raw_hex).context("decode confirmed raw Dogecoin transaction")?;
             let confirmations = verbose
                 .get("confirmations")
                 .and_then(Value::as_u64)
@@ -1912,11 +1928,10 @@ async fn confirm_with_electrs(
                     .status
                     .block_height
                     .ok_or_else(|| anyhow!("confirmed Electrs transaction missing block_height"))?;
-                let block_hash_text = transaction
-                    .status
-                    .block_hash
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("confirmed Electrs transaction missing block_hash"))?;
+                let block_hash_text =
+                    transaction.status.block_hash.as_deref().ok_or_else(|| {
+                        anyhow!("confirmed Electrs transaction missing block_hash")
+                    })?;
                 let tip_height = electrs_get_text(client, format!("{base}/blocks/tip/height"))
                     .await?
                     .parse::<u32>()
@@ -1924,30 +1939,33 @@ async fn confirm_with_electrs(
                 let confirmations = tip_height
                     .checked_sub(block_height)
                     .and_then(|depth| depth.checked_add(1))
-                    .ok_or_else(|| anyhow!("Electrs tip {tip_height} precedes block {block_height}"))?;
+                    .ok_or_else(|| {
+                        anyhow!("Electrs tip {tip_height} precedes block {block_height}")
+                    })?;
                 if confirmations < minimum {
                     last_status = format!("{confirmations} confirmations");
                 } else {
                     let raw_hex = electrs_get_text(client, format!("{base}/tx/{txid}/hex")).await?;
                     let raw_bytes = hex::decode(raw_hex.trim())
                         .context("decode confirmed raw transaction from Electrs")?;
-                    let block_txids: Vec<String> = electrs_get_json(
-                        client,
-                        format!("{base}/block/{block_hash_text}/txids"),
-                    )
-                    .await?;
+                    let block_txids: Vec<String> =
+                        electrs_get_json(client, format!("{base}/block/{block_hash_text}/txids"))
+                            .await?;
                     let tx_index = block_txids
                         .iter()
                         .position(|candidate| candidate.eq_ignore_ascii_case(txid))
                         .ok_or_else(|| anyhow!("confirmed txid absent from Electrs block txids"))?;
-                    let tx_index = u16::try_from(tx_index)
-                        .context("Electrs transaction index exceeds u16")?;
+                    let tx_index =
+                        u16::try_from(tx_index).context("Electrs transaction index exceeds u16")?;
                     let verbose = electrs_transaction_to_verbose(&transaction, confirmations);
                     return Ok(ConfirmedWithdrawal {
                         verbose,
                         raw_bytes,
                         confirmations,
-                        block_hash: decode_displayed_hash32("Electrs block hash", &block_hash_text)?,
+                        block_hash: decode_displayed_hash32(
+                            "Electrs block hash",
+                            &block_hash_text,
+                        )?,
                         block_height,
                         tx_index,
                         block_txids,
@@ -1958,7 +1976,10 @@ async fn confirm_with_electrs(
             Err(error) => last_status = error.to_string(),
         }
         if started.elapsed() >= timeout {
-            bail!("tx {txid} was not confirmed after {}s: {last_status}", timeout.as_secs());
+            bail!(
+                "tx {txid} was not confirmed after {}s: {last_status}",
+                timeout.as_secs()
+            );
         }
         sleep(interval).await;
     }
@@ -1980,9 +2001,16 @@ fn sats_to_doge_decimal(sats: u64) -> String {
 }
 
 async fn electrs_get_text(client: &HttpClient, url: String) -> Result<String> {
-    let response = client.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
     let status = response.status();
-    let body = response.text().await.with_context(|| format!("read {url}"))?;
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("read {url}"))?;
     if !status.is_success() {
         bail!("Electrs GET {url} returned {status}: {body}");
     }
@@ -2653,11 +2681,8 @@ mod electrs_confirmation_tests {
             }],
         };
         let verbose = electrs_transaction_to_verbose(&transaction, 6);
-        let (vout, sats) = extract_vout_and_sats(
-            &verbose,
-            "nofLfRtQuCU4VxDyGfAYQ2KpqFRZ61fGEM",
-        )
-        .unwrap();
+        let (vout, sats) =
+            extract_vout_and_sats(&verbose, "nofLfRtQuCU4VxDyGfAYQ2KpqFRZ61fGEM").unwrap();
         assert_eq!((vout, sats), (0, 123_456_789));
         assert_eq!(verbose["confirmations"], 6);
     }
