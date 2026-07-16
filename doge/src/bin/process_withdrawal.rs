@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use doge_bridge_client::operator_store::{
     CustodyUtxo, CustodyUtxoStatus, DogecoinTransaction, OperatorStatus, OperatorStore,
     ProcessWithdrawal, WithdrawalRequest,
@@ -74,6 +74,7 @@ const GENERIC_BUFFER_CHUNK_SIZE: usize = SOLANA_TRANSACTION_SIZE_LIMIT
     - GENERIC_BUFFER_WRITE_TRANSACTION_SAFETY_MARGIN;
 const AUTHORIZE_COMPUTE_UNITS: u32 = 1_400_000;
 const WORMHOLE_FEE_PREPAY_LAMPORTS: u64 = 1_000;
+const WITHDRAWAL_REQUIRED_CONFIRMATIONS: u32 = 6;
 const DUST_THRESHOLD_SATS: u64 = 10_000;
 const SOLANA_EMITTER_CHAIN: u16 = 1;
 
@@ -82,14 +83,48 @@ const SOLANA_EMITTER_CHAIN: u16 = 1;
 /// authorize_withdrawal.
 const DELEGATED_MANAGER_SET_PROGRAM_ID: &str = "wdmsTJP6YnsfeQjPuuEzGCrHmZvTmNy8VkxMCK8JkBX";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum NetworkProfile {
+    Regtest,
+    Testnet,
+}
+
+impl NetworkProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Regtest => "regtest",
+            Self::Testnet => "testnet",
+        }
+    }
+
+    fn uses_dogecoin_rpc(self) -> bool {
+        matches!(self, Self::Regtest)
+    }
+
+    fn encode_address(self, address_type: u32, payload: [u8; 20]) -> Result<String> {
+        let version = match (self, address_type) {
+            (Self::Regtest, 0) => 0x6f,
+            (Self::Testnet, 0) => 0x71,
+            (_, 1) => 0xc4,
+            (_, other) => bail!("unsupported Dogecoin address type {other}"),
+        };
+        let mut bytes = Vec::with_capacity(21);
+        bytes.push(version);
+        bytes.extend_from_slice(&payload);
+        Ok(bs58::encode(bytes).with_check().into_string())
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "process-withdrawal",
     about = "Authorize, relay, confirm, and finalize a Dogecoin withdrawal through the output-only bridge",
-    long_about = "Loads an authoritative Solana withdrawal request, selects custody UTXOs, constructs the UTX0 payload, authorizes it atomically on-chain with request membership and output checks plus Wormhole VAA emission, obtains local manager signatures, broadcasts the signed Dogecoin transaction through electrs, waits for confirmation, and finalizes the bridge state.",
-    after_long_help = "The local manager service must be running (local_manager_service --listen 127.0.0.1:7071). Manager set index 0 is the deterministic local-regtest 5-of-7 fixture."
+    long_about = "Loads an authoritative Solana withdrawal request, selects custody UTXOs, authorizes a local noop VAA, obtains deterministic local set-0 Manager signatures, broadcasts through Electrs, waits for network-specific confirmation, and finalizes permissionlessly.",
+    after_long_help = "Select --network regtest (default) for Dogecoin RPC mining/confirmation or --network testnet for passive Electrs confirmation without Dogecoin RPC. Both profiles use the local noop shim and deterministic local Manager set 0; this is not public Guardian success."
 )]
 struct Args {
+    #[arg(long, value_enum, default_value_t = NetworkProfile::Regtest)]
+    network: NetworkProfile,
     #[arg(
         long,
         conflicts_with = "request_signature",
@@ -102,6 +137,10 @@ struct Args {
         required_unless_present = "request_index"
     )]
     request_signature: Option<Signature>,
+    /// Resume after a confirmed authorize transaction when the prior CLI process
+    /// exited before recording its metadata. Reconstructed bindings are verified.
+    #[arg(long)]
+    resume_authorize_signature: Option<Signature>,
     #[arg(long, default_value_t = 1_000_000)]
     fee_sats: u64,
     #[arg(long, default_value_t = DUST_THRESHOLD_SATS)]
@@ -140,9 +179,9 @@ struct Args {
     manager_service_url: String,
     #[arg(long, default_value = "http://127.0.0.1:3002")]
     electrs_url: String,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value_t = WITHDRAWAL_REQUIRED_CONFIRMATIONS, value_parser = clap::value_parser!(u32).range(WITHDRAWAL_REQUIRED_CONFIRMATIONS as i64..))]
     mine_blocks: u32,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value_t = WITHDRAWAL_REQUIRED_CONFIRMATIONS, value_parser = clap::value_parser!(u32).range(WITHDRAWAL_REQUIRED_CONFIRMATIONS as i64..))]
     min_confirmations: u32,
     #[arg(long, default_value_t = 120)]
     confirmation_timeout_secs: u64,
@@ -243,6 +282,36 @@ struct RelayedTransaction {
     final_txid: [u8; 32],
     txid_text: String,
     evidence: RelayEvidence,
+}
+
+#[derive(Debug)]
+struct ConfirmedWithdrawal {
+    verbose: Value,
+    raw_bytes: Vec<u8>,
+    confirmations: u32,
+    block_hash: [u8; 32],
+    block_height: u32,
+    tx_index: u16,
+    block_txids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ElectrsTransaction {
+    status: ElectrsTransactionStatus,
+    vout: Vec<ElectrsVout>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ElectrsTransactionStatus {
+    confirmed: bool,
+    block_height: Option<u32>,
+    block_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ElectrsVout {
+    scriptpubkey_address: Option<String>,
+    value: u64,
 }
 
 #[derive(Debug)]
@@ -349,10 +418,9 @@ async fn run(args: Args) -> Result<()> {
     if fee.amount_after_fees == 0 {
         bail!("withdrawal amount after fees is zero");
     }
-    let recipient_address = dogecoin_regtest_address(
-        selected.record.address_type,
-        selected.record.recipient_address,
-    )?;
+    let recipient_address = args
+        .network
+        .encode_address(selected.record.address_type, selected.record.recipient_address)?;
 
     store.upsert_withdrawal_request(&store_request(
         &selected,
@@ -376,12 +444,17 @@ async fn run(args: Args) -> Result<()> {
         OperatorStatus::Snapshotted,
     ))?;
 
-    let doge = DogeRpc::new(
-        args.doge_rpc_url.clone(),
-        args.doge_rpc_user.clone(),
-        args.doge_rpc_password.clone(),
-    );
-    verify_regtest(&doge).await?;
+    let doge = if args.network.uses_dogecoin_rpc() {
+        let doge = DogeRpc::new(
+            args.doge_rpc_url.clone(),
+            args.doge_rpc_user.clone(),
+            args.doge_rpc_password.clone(),
+        );
+        verify_regtest(&doge).await?;
+        Some(doge)
+    } else {
+        None
+    };
 
     // Select custody UTXOs — operator chooses which UTXOs to spend.
     // No spent-tree computation: the bridge no longer tracks which custody
@@ -413,6 +486,7 @@ async fn run(args: Args) -> Result<()> {
 
     let manager_set = local_regtest_manager_set();
     let prepared = build_prepared_transaction(
+        args.network,
         &selected,
         &reserved_utxos,
         &plan,
@@ -517,28 +591,37 @@ async fn run(args: Args) -> Result<()> {
     );
     let (fee_collector_pda, _) =
         Pubkey::find_program_address(&[b"fee_collector"], &args.wormhole_core_program);
-    ensure_operator_authorize_funding(&solana_rpc, &payer, &operator).await?;
-    let fee_prepay_ix = system_instruction::transfer(
-        &operator.pubkey(),
-        &fee_collector_pda,
-        WORMHOLE_FEE_PREPAY_LAMPORTS,
-    );
-    let authorize_signature = send_solana_transaction(
+    let authorize_signature = if let Some(signature) = args.resume_authorize_signature {
+        println!("Resuming confirmed authorize_withdrawal transaction {signature}");
+        signature
+    } else {
+        ensure_fee_collector_rent_funding(&solana_rpc, &payer, fee_collector_pda).await?;
+        ensure_operator_authorize_funding(&solana_rpc, &payer, &operator).await?;
+        let fee_prepay_ix = system_instruction::transfer(
+            &operator.pubkey(),
+            &fee_collector_pda,
+            WORMHOLE_FEE_PREPAY_LAMPORTS,
+        );
+        send_solana_transaction(
+            &solana_rpc,
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(AUTHORIZE_COMPUTE_UNITS),
+                fee_prepay_ix,
+                authorize_ix,
+            ],
+            &[&operator],
+        )
+        .await
+        .context("submit authorize_withdrawal")?
+    };
+    let authorize_meta = wait_for_transaction_meta(
         &solana_rpc,
-        &payer,
-        &[
-            ComputeBudgetInstruction::set_compute_unit_limit(AUTHORIZE_COMPUTE_UNITS),
-            fee_prepay_ix,
-            authorize_ix,
-        ],
-        &[&operator],
+        &authorize_signature,
+        Duration::from_secs(30),
     )
     .await
-    .context("submit authorize_withdrawal")?;
-    let authorize_meta = solana_rpc
-        .get_transaction(&authorize_signature, UiTransactionEncoding::Base64)
-        .await
-        .context("fetch authorize_withdrawal transaction")?;
+    .context("fetch authorize_withdrawal transaction")?;
 
     // Verify the bridge state was not mutated by authorization (only the
     // active intent hash and pending PDA should change).
@@ -668,7 +751,8 @@ async fn run(args: Args) -> Result<()> {
                 "recipientAmountSats": fee.amount_after_fees,
                 "addressType": selected.record.address_type,
                 "recipientPayloadHex": hex::encode(selected.record.recipient_address),
-                "recipientRegtestAddress": recipient_address,
+                "network": args.network.as_str(),
+                "recipientAddress": recipient_address,
                 "snapshotSignature": snapshot_signature.to_string(),
             }),
             authorize: json!({
@@ -751,25 +835,26 @@ async fn run(args: Args) -> Result<()> {
 
     // ── Stage 4: Confirm ───────────────────────────────────────────────────
 
-    let mining_address = doge
-        .call("getnewaddress", json!([]))
-        .await?
-        .as_str()
-        .ok_or_else(|| anyhow!("getnewaddress result is not a string"))?
-        .to_owned();
-    doge.call(
-        "generatetoaddress",
-        json!([args.mine_blocks, mining_address]),
-    )
-    .await?;
-    let verbose = wait_for_doge_confirmation(
-        &doge,
+    let confirmation = confirm_withdrawal(
+        args.network,
+        doge.as_ref(),
+        &http,
+        &args.electrs_url,
         &relayed.txid_text,
+        args.mine_blocks,
         args.min_confirmations,
         Duration::from_secs(args.confirmation_timeout_secs),
         Duration::from_millis(args.poll_interval_ms),
     )
     .await?;
+    wait_for_bridge_confirmation_height(
+        &bridge_client,
+        confirmation.block_height,
+        Duration::from_secs(args.confirmation_timeout_secs),
+        Duration::from_millis(args.poll_interval_ms),
+    )
+    .await?;
+    let verbose = confirmation.verbose;
     let (withdrawal_vout, paid_sats) = extract_vout_and_sats(&verbose, &recipient_address)?;
     if withdrawal_vout != 0 || paid_sats != fee.amount_after_fees {
         bail!(
@@ -777,14 +862,7 @@ async fn run(args: Args) -> Result<()> {
             fee.amount_after_fees
         );
     }
-    let confirmed_raw_hex = doge
-        .call("getrawtransaction", json!([relayed.txid_text, false]))
-        .await?
-        .as_str()
-        .ok_or_else(|| anyhow!("getrawtransaction result is not hex"))?
-        .to_owned();
-    let confirmed_raw_bytes =
-        hex::decode(confirmed_raw_hex).context("decode confirmed raw Dogecoin transaction")?;
+    let confirmed_raw_bytes = confirmation.raw_bytes;
     if confirmed_raw_bytes != relayed.raw_bytes {
         bail!("confirmed Dogecoin transaction differs from the manager-signed bytes");
     }
@@ -792,12 +870,11 @@ async fn run(args: Args) -> Result<()> {
     if final_txid != relayed.final_txid {
         bail!("confirmed Dogecoin transaction txid changed after broadcast");
     }
-    let confirmations = verbose
-        .get("confirmations")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
-    let (block_hash, block_height, tx_index_in_block, block_txids) =
-        confirmed_position(&doge, &verbose, &relayed.txid_text).await?;
+    let confirmations = confirmation.confirmations;
+    let block_hash = confirmation.block_hash;
+    let block_height = confirmation.block_height;
+    let tx_index_in_block = confirmation.tx_index;
+    let block_txids = confirmation.block_txids;
 
     // Register the change UTXO (custody management — operator responsibility).
     let change_utxo = if let (Some(change_hash), Some(change_address)) = (
@@ -883,10 +960,13 @@ async fn run(args: Args) -> Result<()> {
     let finalize_signature = send_solana_transaction(&solana_rpc, &payer, &[finalize_ix], &[])
         .await
         .context("submit permissionless finalize_confirmed_withdrawal discriminator 17")?;
-    let finalize_meta = solana_rpc
-        .get_transaction(&finalize_signature, UiTransactionEncoding::Base64)
-        .await
-        .context("fetch finalize_confirmed_withdrawal transaction")?;
+    let finalize_meta = wait_for_transaction_meta(
+        &solana_rpc,
+        &finalize_signature,
+        Duration::from_secs(30),
+    )
+    .await
+    .context("fetch finalize_confirmed_withdrawal transaction")?;
 
     let finalized_state = bridge_client
         .get_current_bridge_state()
@@ -929,7 +1009,8 @@ async fn run(args: Args) -> Result<()> {
             "recipientAmountSats": fee.amount_after_fees,
             "addressType": selected.record.address_type,
             "recipientPayloadHex": hex::encode(selected.record.recipient_address),
-            "recipientRegtestAddress": recipient_address,
+            "network": args.network.as_str(),
+            "recipientAddress": recipient_address,
             "snapshotSignature": snapshot_signature.to_string(),
         }),
         authorize: json!({
@@ -1019,6 +1100,7 @@ fn write_evidence(path: &Path, evidence: &Evidence) -> Result<()> {
 }
 
 fn build_prepared_transaction(
+    network: NetworkProfile,
     selected: &IndexedRequest,
     reserved_utxos: &[CustodyUtxo],
     plan: &doge_local_ops::CustodyTransactionPlan,
@@ -1040,7 +1122,7 @@ fn build_prepared_transaction(
             &manager_set.pubkeys,
         )?;
         let script_hash = hash160(&redeem_script);
-        let derived_address = dogecoin_regtest_address(1, script_hash)?;
+        let derived_address = network.encode_address(1, script_hash)?;
         if derived_address != utxo.custody_address {
             bail!(
                 "custody UTXO {}:{} address {} does not match derived P2SH address {}",
@@ -1091,7 +1173,7 @@ fn build_prepared_transaction(
             &manager_set.pubkeys,
         )?;
         let change_hash = hash160(&change_redeem_script);
-        let change_address = dogecoin_regtest_address(1, change_hash)?;
+        let change_address = network.encode_address(1, change_hash)?;
         if change_address == recipient_address {
             bail!("derived change address equals the withdrawal recipient address");
         }
@@ -1728,16 +1810,191 @@ fn verify_snapshot(
     Ok(())
 }
 
-fn dogecoin_regtest_address(address_type: u32, payload: [u8; 20]) -> Result<String> {
-    let version = match address_type {
-        0 => 0x6f,
-        1 => 0xc4,
-        other => bail!("unsupported Dogecoin address type {other}"),
-    };
-    let mut bytes = Vec::with_capacity(21);
-    bytes.push(version);
-    bytes.extend_from_slice(&payload);
-    Ok(bs58::encode(bytes).with_check().into_string())
+async fn wait_for_bridge_confirmation_height(
+    bridge_client: &BridgeClient,
+    withdrawal_block_height: u32,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<()> {
+    // The program currently checks `withdrawal_height + 6 <= finalized_height`.
+    // This is stricter than the six-deep Electrs observation (tip >= height+5),
+    // so wait for the actual on-chain acceptance boundary before discriminator 17.
+    let required_height = withdrawal_block_height
+        .checked_add(WITHDRAWAL_REQUIRED_CONFIRMATIONS)
+        .ok_or_else(|| anyhow!("required bridge confirmation height overflow"))?;
+    let started = Instant::now();
+    loop {
+        let state = bridge_client
+            .get_current_bridge_state()
+            .await
+            .context("read bridge finalized height while waiting to finalize withdrawal")?;
+        let finalized_height = state.bridge_header.finalized_state.block_height;
+        if finalized_height >= required_height {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "local bridge finalized height {finalized_height} did not reach required {required_height} after {}s",
+                timeout.as_secs(),
+            );
+        }
+        sleep(interval).await;
+    }
+}
+
+async fn confirm_withdrawal(
+    network: NetworkProfile,
+    doge: Option<&DogeRpc>,
+    client: &HttpClient,
+    electrs_url: &str,
+    txid: &str,
+    mine_blocks: u32,
+    minimum: u32,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<ConfirmedWithdrawal> {
+    match network {
+        NetworkProfile::Regtest => {
+            let doge = doge.ok_or_else(|| anyhow!("regtest confirmation requires Dogecoin RPC"))?;
+            let mining_address = doge
+                .call("getnewaddress", json!([]))
+                .await?
+                .as_str()
+                .ok_or_else(|| anyhow!("getnewaddress result is not a string"))?
+                .to_owned();
+            doge.call("generatetoaddress", json!([mine_blocks, mining_address]))
+                .await?;
+            let verbose = wait_for_doge_confirmation(doge, txid, minimum, timeout, interval).await?;
+            let raw_hex = doge
+                .call("getrawtransaction", json!([txid, false]))
+                .await?
+                .as_str()
+                .ok_or_else(|| anyhow!("getrawtransaction result is not hex"))?
+                .to_owned();
+            let raw_bytes = hex::decode(raw_hex).context("decode confirmed raw Dogecoin transaction")?;
+            let confirmations = verbose
+                .get("confirmations")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let (block_hash, block_height, tx_index, block_txids) =
+                confirmed_position(doge, &verbose, txid).await?;
+            Ok(ConfirmedWithdrawal {
+                verbose,
+                raw_bytes,
+                confirmations,
+                block_hash,
+                block_height,
+                tx_index,
+                block_txids,
+            })
+        }
+        NetworkProfile::Testnet => {
+            confirm_with_electrs(client, electrs_url, txid, minimum, timeout, interval).await
+        }
+    }
+}
+
+async fn confirm_with_electrs(
+    client: &HttpClient,
+    electrs_url: &str,
+    txid: &str,
+    minimum: u32,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<ConfirmedWithdrawal> {
+    let started = Instant::now();
+    let base = electrs_url.trim_end_matches('/');
+    let mut last_status = "transaction not yet visible".to_owned();
+    loop {
+        match electrs_get_json::<ElectrsTransaction>(client, format!("{base}/tx/{txid}")).await {
+            Ok(transaction) if transaction.status.confirmed => {
+                let block_height = transaction
+                    .status
+                    .block_height
+                    .ok_or_else(|| anyhow!("confirmed Electrs transaction missing block_height"))?;
+                let block_hash_text = transaction
+                    .status
+                    .block_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("confirmed Electrs transaction missing block_hash"))?;
+                let tip_height = electrs_get_text(client, format!("{base}/blocks/tip/height"))
+                    .await?
+                    .parse::<u32>()
+                    .context("parse Electrs tip height")?;
+                let confirmations = tip_height
+                    .checked_sub(block_height)
+                    .and_then(|depth| depth.checked_add(1))
+                    .ok_or_else(|| anyhow!("Electrs tip {tip_height} precedes block {block_height}"))?;
+                if confirmations < minimum {
+                    last_status = format!("{confirmations} confirmations");
+                } else {
+                    let raw_hex = electrs_get_text(client, format!("{base}/tx/{txid}/hex")).await?;
+                    let raw_bytes = hex::decode(raw_hex.trim())
+                        .context("decode confirmed raw transaction from Electrs")?;
+                    let block_txids: Vec<String> = electrs_get_json(
+                        client,
+                        format!("{base}/block/{block_hash_text}/txids"),
+                    )
+                    .await?;
+                    let tx_index = block_txids
+                        .iter()
+                        .position(|candidate| candidate.eq_ignore_ascii_case(txid))
+                        .ok_or_else(|| anyhow!("confirmed txid absent from Electrs block txids"))?;
+                    let tx_index = u16::try_from(tx_index)
+                        .context("Electrs transaction index exceeds u16")?;
+                    let verbose = electrs_transaction_to_verbose(&transaction, confirmations);
+                    return Ok(ConfirmedWithdrawal {
+                        verbose,
+                        raw_bytes,
+                        confirmations,
+                        block_hash: decode_displayed_hash32("Electrs block hash", &block_hash_text)?,
+                        block_height,
+                        tx_index,
+                        block_txids,
+                    });
+                }
+            }
+            Ok(_) => last_status = "transaction is unconfirmed".to_owned(),
+            Err(error) => last_status = error.to_string(),
+        }
+        if started.elapsed() >= timeout {
+            bail!("tx {txid} was not confirmed after {}s: {last_status}", timeout.as_secs());
+        }
+        sleep(interval).await;
+    }
+}
+
+fn electrs_transaction_to_verbose(transaction: &ElectrsTransaction, confirmations: u32) -> Value {
+    json!({
+        "confirmations": confirmations,
+        "vout": transaction.vout.iter().enumerate().map(|(index, output)| json!({
+            "n": index,
+            "value": sats_to_doge_decimal(output.value),
+            "scriptPubKey": { "addresses": output.scriptpubkey_address.iter().collect::<Vec<_>>() },
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn sats_to_doge_decimal(sats: u64) -> String {
+    format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000)
+}
+
+async fn electrs_get_text(client: &HttpClient, url: String) -> Result<String> {
+    let response = client.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    let body = response.text().await.with_context(|| format!("read {url}"))?;
+    if !status.is_success() {
+        bail!("Electrs GET {url} returned {status}: {body}");
+    }
+    Ok(body.trim().to_owned())
+}
+
+async fn electrs_get_json<T: serde::de::DeserializeOwned>(
+    client: &HttpClient,
+    url: String,
+) -> Result<T> {
+    let body = electrs_get_text(client, url.clone()).await?;
+    serde_json::from_str(&body).with_context(|| format!("decode Electrs response from {url}"))
 }
 
 async fn verify_regtest(rpc: &DogeRpc) -> Result<()> {
@@ -2024,6 +2281,36 @@ fn operator_funding_transfer_amount(
     Ok(Some(top_up))
 }
 
+async fn ensure_fee_collector_rent_funding(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    fee_collector: Pubkey,
+) -> Result<()> {
+    let rent_reserve = rpc
+        .get_minimum_balance_for_rent_exemption(0)
+        .await
+        .context("read fee-collector rent exemption")?;
+    let balance = rpc
+        .get_balance(&fee_collector)
+        .await
+        .with_context(|| format!("read fee collector balance {fee_collector}"))?;
+    if balance >= rent_reserve {
+        return Ok(());
+    }
+    let top_up = rent_reserve
+        .checked_sub(balance)
+        .ok_or_else(|| anyhow!("fee-collector rent top-up underflow"))?;
+    let transfer = system_instruction::transfer(&payer.pubkey(), &fee_collector, top_up);
+    let signature = send_solana_transaction(rpc, payer, &[transfer], &[])
+        .await
+        .context("fund fee collector rent reserve before authorize_withdrawal")?;
+    println!(
+        "Funded fee collector {fee_collector} with {top_up} rent-reserve lamports from payer {} before authorize_withdrawal (transaction: {signature})",
+        payer.pubkey(),
+    );
+    Ok(())
+}
+
 async fn ensure_operator_authorize_funding(
     rpc: &RpcClient,
     payer: &Keypair,
@@ -2068,6 +2355,28 @@ async fn ensure_operator_authorize_funding(
         signature,
     );
     Ok(())
+}
+
+async fn wait_for_transaction_meta(
+    rpc: &RpcClient,
+    signature: &Signature,
+    timeout: Duration,
+) -> Result<solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta> {
+    let started = Instant::now();
+    let mut last_error = None;
+    while started.elapsed() < timeout {
+        match rpc
+            .get_transaction(signature, UiTransactionEncoding::Base64)
+            .await
+        {
+            Ok(transaction) => return Ok(transaction),
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("transaction {signature} was not readable before timeout")))
 }
 
 async fn send_solana_transaction(
@@ -2323,6 +2632,58 @@ mod generic_buffer_tests {
         }
         assert_eq!(expected_offset, proof.len());
         assert_eq!(reconstructed, proof);
+    }
+}
+
+#[cfg(test)]
+mod electrs_confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn electrs_confirmation_converts_outputs_for_existing_amount_parser() {
+        let transaction = ElectrsTransaction {
+            status: ElectrsTransactionStatus {
+                confirmed: true,
+                block_height: Some(100),
+                block_hash: Some("11".repeat(32)),
+            },
+            vout: vec![ElectrsVout {
+                scriptpubkey_address: Some("nofLfRtQuCU4VxDyGfAYQ2KpqFRZ61fGEM".into()),
+                value: 123_456_789,
+            }],
+        };
+        let verbose = electrs_transaction_to_verbose(&transaction, 6);
+        let (vout, sats) = extract_vout_and_sats(
+            &verbose,
+            "nofLfRtQuCU4VxDyGfAYQ2KpqFRZ61fGEM",
+        )
+        .unwrap();
+        assert_eq!((vout, sats), (0, 123_456_789));
+        assert_eq!(verbose["confirmations"], 6);
+    }
+
+    #[test]
+    fn required_confirmation_depth_matches_on_chain_contract() {
+        assert_eq!(WITHDRAWAL_REQUIRED_CONFIRMATIONS, 6);
+        assert_eq!(sats_to_doge_decimal(100_000_001), "1.00000001");
+    }
+    #[test]
+    fn testnet_profile_never_selects_dogecoin_rpc_or_mining() {
+        assert!(!NetworkProfile::Testnet.uses_dogecoin_rpc());
+        assert!(NetworkProfile::Regtest.uses_dogecoin_rpc());
+    }
+
+    #[test]
+    fn testnet_profile_uses_dogecoin_address_versions() {
+        let payload = [0x11; 20];
+        assert_ne!(
+            NetworkProfile::Regtest.encode_address(0, payload).unwrap(),
+            NetworkProfile::Testnet.encode_address(0, payload).unwrap(),
+        );
+        assert_eq!(
+            NetworkProfile::Regtest.encode_address(1, payload).unwrap(),
+            NetworkProfile::Testnet.encode_address(1, payload).unwrap(),
+        );
     }
 }
 

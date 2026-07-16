@@ -30,7 +30,7 @@ psy-bridge-core = { path = "../../psy-doge-solana-bridge/libraries/psy-bridge-co
 # TODO: switch to git dep when bridge is pushed to devnet branch
 # psy-doge-solana-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", default-features = false, features = ["std", "serialize_bytemuck", "fake_signer"] }
 psy-doge-solana-core = { path = "../../psy-doge-solana-bridge/libraries/psy-doge-solana-core", default-features = false, features = ["std", "serialize_bytemuck", "serialize_serde", "fake_signer"] }
-reqwest = { version = "=0.12.24", default-features = false, features = ["json"] }
+reqwest = { version = "=0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 ripemd = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }

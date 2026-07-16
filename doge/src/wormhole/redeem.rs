@@ -6,7 +6,7 @@
 //! ```text
 //! <emitter_chain u16 BE>      // minimal data push (0x02 || 2 bytes)
 //! <emitter_contract 32B>      // 0x20 || 32 bytes
-//! OP_2DROP                     // 0x6b
+//! OP_2DROP                     // 0x6d
 //! <recipient 32B>             // 0x20 || 32 bytes
 //! OP_DROP                      // 0x75
 //! OP_M                         // 0x51 + (m-1)   (m in 1..=16)
@@ -30,7 +30,7 @@ const OP_PUSHDATA4: u8 = 0x4e;
 const OP_0: u8 = 0x00;
 const OP_1NEGATE: u8 = 0x4f;
 const OP_1: u8 = 0x51; // OP_n = OP_1 + (n - 1) for n in 1..=16
-const OP_2DROP: u8 = 0x6b;
+const OP_2DROP: u8 = 0x6d;
 const OP_DROP: u8 = 0x75;
 const OP_CHECKMULTISIG: u8 = 0xae;
 
@@ -187,6 +187,12 @@ mod tests {
 
     // Reproduces `TestBuildRedeemScript` from `script_test.go` byte-for-byte.
     #[test]
+    fn op_2drop_byte_matches_dogecoin_opcode_table() {
+        assert_eq!(OP_2DROP, bitcoin::opcodes::all::OP_2DROP.to_u8());
+        assert_ne!(OP_2DROP, bitcoin::opcodes::all::OP_TOALTSTACK.to_u8());
+    }
+
+    #[test]
     fn matches_wormhole_script_go_basic() {
         let emitter_chain = 1u16; // ChainIDSolana
         let emitter_contract =
@@ -203,7 +209,7 @@ mod tests {
         // Hand-derived expectation matching btcd AddData/AddInt64:
         //   0x02 0x00 0x01            (push 2-byte chain BE = 1)
         //   0x20 <contract>           (push 32-byte contract)
-        //   0x6b                      (OP_2DROP)
+        //   0x6d                      (OP_2DROP)
         //   0x20 <recipient>          (push 32-byte recipient)
         //   0x75                      (OP_DROP)
         //   0x52                      (OP_2 = m)
@@ -215,7 +221,7 @@ mod tests {
         expected.extend_from_slice(&[0x02, 0x00, 0x01]);
         expected.push(0x20);
         expected.extend_from_slice(&emitter_contract);
-        expected.push(0x6b);
+        expected.push(0x6d);
         expected.push(0x20);
         expected.extend_from_slice(&recipient);
         expected.push(0x75);
@@ -249,7 +255,7 @@ mod tests {
         assert_eq!(script[script.len() - 1], 0xae); // OP_CHECKMULTISIG
         assert!(script.contains(&0x55));
         assert!(script.contains(&0x57));
-        assert!(script.contains(&0x6b)); // OP_2DROP
+        assert!(script.contains(&0x6d)); // OP_2DROP
         assert!(script.contains(&0x75)); // OP_DROP
     }
 
