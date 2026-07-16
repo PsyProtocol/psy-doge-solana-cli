@@ -1,4 +1,4 @@
 /target/
-bridge-config/keys/
+doge/target/
 *.sqlite3
 *.bin

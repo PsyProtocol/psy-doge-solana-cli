@@ -1,4 +1,5 @@
 pub mod custody_ops;
+pub mod wormhole;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -140,7 +141,9 @@ pub fn extract_vout_and_sats(verbose: &Value, address: &str) -> Result<(u32, u64
                 .ok_or_else(|| anyhow!("matching vout missing value"))?,
         )?;
         if match_found.replace((index, sats)).is_some() {
-            bail!("transaction has multiple outputs for address {address}; exact vout is ambiguous");
+            bail!(
+                "transaction has multiple outputs for address {address}; exact vout is ambiguous"
+            );
         }
     }
 
@@ -180,7 +183,6 @@ pub fn validate_proof_artifact_bytes(
     })?;
     Ok((proof, public_values))
 }
-
 
 /// Explicit output plan for a tracked-custody withdrawal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,7 +265,10 @@ pub fn validate_decoded_custody_transaction(
                 .get("vout")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow!("decoded input missing vout"))?;
-            Ok((txid, u32::try_from(vout).context("decoded input vout exceeds u32")?))
+            Ok((
+                txid,
+                u32::try_from(vout).context("decoded input vout exceeds u32")?,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut wanted_inputs = expected_inputs
@@ -308,7 +313,11 @@ pub fn validate_decoded_custody_transaction(
                 || script
                     .get("addresses")
                     .and_then(Value::as_array)
-                    .map(|addresses| addresses.iter().any(|candidate| candidate.as_str() == Some(address)))
+                    .map(|addresses| {
+                        addresses
+                            .iter()
+                            .any(|candidate| candidate.as_str() == Some(address))
+                    })
                     .unwrap_or(false)
         };
         if matches_address(recipient_address) && amount == plan.recipient_sats {
@@ -355,7 +364,10 @@ pub fn tracked_utxo_spent_commitment(
     ordered.sort_unstable_by_key(|outpoint| (outpoint.leaf_index, outpoint.txid, outpoint.vout));
     for pair in ordered.windows(2) {
         if pair[0].leaf_index == pair[1].leaf_index {
-            bail!("duplicate tracked custody leaf index {}", pair[0].leaf_index);
+            bail!(
+                "duplicate tracked custody leaf index {}",
+                pair[0].leaf_index
+            );
         }
     }
     const DOMAIN: &[u8] = b"psy-doge-local-tracked-spent-v1";
@@ -379,7 +391,10 @@ mod tests {
     fn parses_dogecoin_amounts_exactly() {
         assert_eq!(doge_amount_to_sats(&json!(1)).unwrap(), 100_000_000);
         assert_eq!(doge_amount_to_sats(&json!(0.00000001)).unwrap(), 1);
-        assert_eq!(doge_amount_to_sats(&json!("12.34000000")).unwrap(), 1_234_000_000);
+        assert_eq!(
+            doge_amount_to_sats(&json!("12.34000000")).unwrap(),
+            1_234_000_000
+        );
         assert!(doge_amount_to_sats(&json!("1.000000001")).is_err());
         assert!(doge_amount_to_sats(&json!(-1)).is_err());
     }
@@ -392,7 +407,10 @@ mod tests {
                 {"n": 2, "value": 1.25, "scriptPubKey": {"addresses": ["deposit"]}}
             ]
         });
-        assert_eq!(extract_vout_and_sats(&legacy, "deposit").unwrap(), (2, 125_000_000));
+        assert_eq!(
+            extract_vout_and_sats(&legacy, "deposit").unwrap(),
+            (2, 125_000_000)
+        );
 
         let modern = json!({
             "vout": [{"n": 7, "value": "0.00000001", "scriptPubKey": {"address": "deposit"}}]
@@ -454,10 +472,7 @@ mod tests {
 
     #[test]
     fn validates_custody_transaction_inputs_and_outputs() {
-        let inputs = vec![
-            ("abc123".to_owned(), 0u32),
-            ("def456".to_owned(), 1u32),
-        ];
+        let inputs = vec![("abc123".to_owned(), 0u32), ("def456".to_owned(), 1u32)];
         let decoded = json!({
             "vin": [
                 {"txid": "abc123", "vout": 0},
@@ -468,8 +483,20 @@ mod tests {
                 {"n": 1, "value": 0.1, "scriptPubKey": {"address": "change-addr"}}
             ]
         });
-        let plan = CustodyTransactionPlan { recipient_sats: 70_000_000, change_sats: 10_000_000, fee_sats: 20_000_000 };
-        validate_decoded_custody_transaction(&decoded, &inputs, "recipient", Some("change-addr"), &plan, 100_000_000).unwrap();
+        let plan = CustodyTransactionPlan {
+            recipient_sats: 70_000_000,
+            change_sats: 10_000_000,
+            fee_sats: 20_000_000,
+        };
+        validate_decoded_custody_transaction(
+            &decoded,
+            &inputs,
+            "recipient",
+            Some("change-addr"),
+            &plan,
+            100_000_000,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -481,10 +508,20 @@ mod tests {
             ],
             "vout": [{"n": 0, "value": 0.5, "scriptPubKey": {"address": "r"}}]
         });
-        let plan = CustodyTransactionPlan { recipient_sats: 50_000_000, change_sats: 0, fee_sats: 10_000_000 };
+        let plan = CustodyTransactionPlan {
+            recipient_sats: 50_000_000,
+            change_sats: 0,
+            fee_sats: 10_000_000,
+        };
         let err = validate_decoded_custody_transaction(
-            &decoded, &[("abc".to_owned(), 0u32)], "r", None, &plan, 60_000_000,
-        ).unwrap_err();
+            &decoded,
+            &[("abc".to_owned(), 0u32)],
+            "r",
+            None,
+            &plan,
+            60_000_000,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("2 inputs, expected exactly 1"));
     }
 
@@ -496,8 +533,16 @@ mod tests {
     #[test]
     fn tracked_commitment_is_deterministic() {
         let outpoints = vec![
-            TrackedSpentOutpoint { txid: [1u8; 32], vout: 0, leaf_index: 5 },
-            TrackedSpentOutpoint { txid: [2u8; 32], vout: 1, leaf_index: 3 },
+            TrackedSpentOutpoint {
+                txid: [1u8; 32],
+                vout: 0,
+                leaf_index: 5,
+            },
+            TrackedSpentOutpoint {
+                txid: [2u8; 32],
+                vout: 1,
+                leaf_index: 3,
+            },
         ];
         let h1 = tracked_utxo_spent_commitment([0u8; 32], &outpoints).unwrap();
         let h2 = tracked_utxo_spent_commitment([0u8; 32], &outpoints).unwrap();
@@ -507,13 +552,29 @@ mod tests {
     #[test]
     fn tracked_commitment_sorts_outpoints() {
         let outpoints = vec![
-            TrackedSpentOutpoint { txid: [1u8; 32], vout: 0, leaf_index: 10 },
-            TrackedSpentOutpoint { txid: [2u8; 32], vout: 1, leaf_index: 5 },
+            TrackedSpentOutpoint {
+                txid: [1u8; 32],
+                vout: 0,
+                leaf_index: 10,
+            },
+            TrackedSpentOutpoint {
+                txid: [2u8; 32],
+                vout: 1,
+                leaf_index: 5,
+            },
         ];
         let h1 = tracked_utxo_spent_commitment([0u8; 32], &outpoints).unwrap();
         let mut reversed = vec![
-            TrackedSpentOutpoint { txid: [2u8; 32], vout: 1, leaf_index: 5 },
-            TrackedSpentOutpoint { txid: [1u8; 32], vout: 0, leaf_index: 10 },
+            TrackedSpentOutpoint {
+                txid: [2u8; 32],
+                vout: 1,
+                leaf_index: 5,
+            },
+            TrackedSpentOutpoint {
+                txid: [1u8; 32],
+                vout: 0,
+                leaf_index: 10,
+            },
         ];
         let h2 = tracked_utxo_spent_commitment([0u8; 32], &reversed).unwrap();
         assert_eq!(h1, h2);
@@ -522,8 +583,16 @@ mod tests {
     #[test]
     fn tracked_commitment_rejects_duplicate_leaf() {
         let outpoints = vec![
-            TrackedSpentOutpoint { txid: [1u8; 32], vout: 0, leaf_index: 5 },
-            TrackedSpentOutpoint { txid: [2u8; 32], vout: 1, leaf_index: 5 },
+            TrackedSpentOutpoint {
+                txid: [1u8; 32],
+                vout: 0,
+                leaf_index: 5,
+            },
+            TrackedSpentOutpoint {
+                txid: [2u8; 32],
+                vout: 1,
+                leaf_index: 5,
+            },
         ];
         assert!(tracked_utxo_spent_commitment([0u8; 32], &outpoints).is_err());
     }

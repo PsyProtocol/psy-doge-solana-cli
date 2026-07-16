@@ -4,26 +4,50 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[workspace]
+
 [dependencies]
 anyhow = "1.0"
+axum = "0.8"
 base64 = "0.21"
 bincode = "=1.3.3"
+# rust-dogecoin (bitcoin crate fork) for transaction construction/signing
+bitcoin = { git = "https://github.com/QEDProtocol/rust-dogecoin", rev = "9b52ed2ddc18c2062c741b7df7a6e70aabde3bb8", features = ["serde"] }
 bs58 = { version = "0.5.1", default-features = false, features = ["alloc", "check"] }
 bytemuck = "1.24"
+borsh = "0.10.4"
+doge-light-client = { path = "../../dlc/doge-light-client", default-features = false, features = ["serialize_borsh", "serialize_bytemuck", "sha2", "std"] }
+psy-doge-bridge-helper = { path = "../../dlc/psy-doge-bridge-helper", features = ["std"] }
+psy-doge-data-link = { path = "../../dlc/psy-doge-data-link", default-features = false, features = ["link_sync"] }
 clap = { version = "4.5", features = ["derive"] }
-doge-bridge-client = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet" }
+# TODO: switch to git dep when bridge is pushed to devnet branch
+# doge-bridge-client = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet" }
+doge-bridge-client = { path = "../../psy-doge-solana-bridge/clients/rust" }
 hex = "0.4"
-psy-bridge-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", default-features = false, features = ["std", "serialize_bytemuck", "sha2"] }
-psy-doge-solana-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", default-features = false, features = ["std", "serialize_bytemuck", "fake_signer"] }
+# TODO: switch to git dep when bridge is pushed to devnet branch
+# psy-bridge-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", default-features = false, features = ["std", "serialize_bytemuck", "sha2"] }
+psy-bridge-core = { path = "../../psy-doge-solana-bridge/libraries/psy-bridge-core", default-features = false, features = ["std", "serialize_bytemuck", "serialize_serde", "sha2"] }
+# TODO: switch to git dep when bridge is pushed to devnet branch
+# psy-doge-solana-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", default-features = false, features = ["std", "serialize_bytemuck", "fake_signer"] }
+psy-doge-solana-core = { path = "../../psy-doge-solana-bridge/libraries/psy-doge-solana-core", default-features = false, features = ["std", "serialize_bytemuck", "serialize_serde", "fake_signer"] }
 reqwest = { version = "=0.12.24", default-features = false, features = ["json"] }
+ripemd = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 sha2 = "0.10"
+sha3 = "0.10"
+secp256k1 = { version = "0.31", features = ["rand", "hashes"] }
 solana-client = "=2.2.1"
 solana-sdk = "=2.2.1"
 solana-transaction-status = "=2.2.1"
+spl-associated-token-account = "7.0.0"
+spl-token = "8.0.0"
 tokio = { version = "1.43", features = ["full"] }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/anza-xyz/curve25519-dalek.git", rev = "b500cdc2a920cd5bff9e2dd974d7b97349d61464" }

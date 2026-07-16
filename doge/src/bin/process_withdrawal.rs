@@ -1,28 +1,42 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
+use doge_bridge_client::operator_store::{
+    CustodyUtxo, CustodyUtxoStatus, DogecoinTransaction, OperatorStatus, OperatorStore,
+    ProcessWithdrawal, WithdrawalRequest,
+};
 use doge_bridge_client::{
     instructions, BridgeApi, BridgeClient, BridgeClientConfigBuilder, BridgeHistorySync,
     HistoryRecord, HistorySyncConfig, NoopShimMonitor, NoopShimMonitorConfig, OperatorApi,
     WithdrawalRequestRecord,
 };
-use doge_bridge_client::operator_store::{
-    CustodyUtxo, CustodyUtxoStatus, DogecoinTransaction, OperatorStatus, OperatorStore,
-    ProcessWithdrawal, WithdrawalRequest,
+use doge_local_ops::wormhole::{
+    manager::{
+        fetch_manager_signatures, fetch_signed_vaa, local_regtest_manager_set, parse_vaa,
+        vaa_hash_matches, vaa_signing_digest, verify_manager_signature, ManagerSet,
+        ManagerSignatures,
+    },
+    redeem::build_redeem_script,
+    tx::{double_sha256, p2sh_script_pubkey, UnsignedTransaction},
+    utx0::{Utx0Input, Utx0Output, Utx0UnlockPayload, UtxoAddressType},
 };
-use doge_local_ops::{
-    custody_ops,
-    extract_vout_and_sats, plan_custody_transaction, tracked_utxo_spent_commitment,
-    validate_decoded_custody_transaction, validate_proof_artifacts, CustodyTransactionPlan,
-    TrackedSpentOutpoint, GROTH16_PROOF_SIZE, SATS_PER_DOGE,
+use doge_local_ops::{custody_ops, extract_vout_and_sats, plan_custody_transaction};
+use psy_bridge_core::crypto::hash::{
+    merkle::fixed_append_tree::FixedMerkleAppendTree, sha256::SHA256_ZERO_HASHES,
+    sha256_impl::hash_impl_sha256_bytes,
 };
-use psy_bridge_core::crypto::hash::sha256_impl::hash_impl_sha256_bytes;
 use psy_doge_solana_core::{
-    program_state::PsyReturnTxOutput,
+    constants::DOGECOIN_CHAIN_ID,
+    instructions::doge_bridge::WithdrawalRequestProof,
+    program_state::{
+        proc_withdrawal::compute_withdrawal_intent_hash, PendingWithdrawal, PsyWithdrawalRequest,
+        PENDING_WITHDRAWAL_STATUS_FINALIZED, PENDING_WITHDRAWAL_STATUS_PENDING_VAA,
+    },
     utils::fees::calcuate_withdrawal_fee,
 };
 use reqwest::Client as HttpClient;
-use serde::Serialize;
-use serde_json::{json, Number, Value};
+use ripemd::Ripemd160;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -35,12 +49,12 @@ use solana_sdk::{
 };
 use solana_transaction_status::UiTransactionEncoding;
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
 };
-use tokio::{process::Command, time::sleep};
+use tokio::time::sleep;
 
 const DEFAULT_DOGE_BRIDGE: &str = "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ";
 const DEFAULT_PENDING_MINT: &str = "PMUSqycT1j5JTLmHk8frGSCido2h9VG1pyh2MPEa33o";
@@ -48,31 +62,46 @@ const DEFAULT_TXO_BUFFER: &str = "TXWhjswto9q6hfaGPuAhDS79wAHKfbMJLVR178xYAaQ";
 const DEFAULT_GENERIC_BUFFER: &str = "GBYLmevzPSBPWfWrJ1h9gNzHqUjDXETzHKL1AasLyKwC";
 const DEFAULT_MANUAL_CLAIM: &str = "MCdYbqiK3uj36tohbMjsh3Ssg8iRSJmSHToNxW8TWWE";
 const DEFAULT_NOOP_SHIM: &str = "FwDChsHWLwbhTiYQ4Sum5mjVWswECi9cmrA11GUFUuxi";
-const EXPECTED_WITHDRAWAL_VK: &str =
-    "0x005ae8dd49562cce3ee0a2cc0cf405d3911e31ee97b56baaedc91092ed53ec6e";
-const PROOF_FILENAME: &str = "withdrawal_groth16_proof.bin";
-const PUBLIC_VALUES_FILENAME: &str = "withdrawal_public_values.bin";
 const GENERIC_BUFFER_HEADER_SIZE: usize = 32;
-const GENERIC_BUFFER_CHUNK_SIZE: usize = 900;
-const PROCESS_COMPUTE_UNITS: u32 = 1_400_000;
+const SOLANA_TRANSACTION_SIZE_LIMIT: usize = 1_232;
+// Serialized legacy transaction overhead for generic_buffer_write with a
+// separate payer and writer: two signatures, five account keys, blockhash,
+// and instruction framing.
+const GENERIC_BUFFER_WRITE_TRANSACTION_OVERHEAD: usize = 338;
+const GENERIC_BUFFER_WRITE_TRANSACTION_SAFETY_MARGIN: usize = 16;
+const GENERIC_BUFFER_CHUNK_SIZE: usize = SOLANA_TRANSACTION_SIZE_LIMIT
+    - GENERIC_BUFFER_WRITE_TRANSACTION_OVERHEAD
+    - GENERIC_BUFFER_WRITE_TRANSACTION_SAFETY_MARGIN;
+const AUTHORIZE_COMPUTE_UNITS: u32 = 1_400_000;
+const WORMHOLE_FEE_PREPAY_LAMPORTS: u64 = 1_000;
 const DUST_THRESHOLD_SATS: u64 = 10_000;
+const SOLANA_EMITTER_CHAIN: u16 = 1;
+
+/// Delegated Manager Set program on Solana (Solana mirror of EVM
+/// DelegatedManagerSet). Used to derive the manager-set PDA for
+/// authorize_withdrawal.
+const DELEGATED_MANAGER_SET_PROGRAM_ID: &str = "wdmsTJP6YnsfeQjPuuEzGCrHmZvTmNy8VkxMCK8JkBX";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "process-withdrawal",
-    about = "Operator-side settlement of an existing Solana pDOGE burn onto Dogecoin regtest",
-    long_about = "Reconstructs the selected request from Solana history, selects tracked bridge-custody UTXOs, constructs an exact Dogecoin transaction with recipient + change + fee, signs through Dogecoin Core wallet, broadcasts, computes spent-root transition from the local tracked-UTXO Merkle tree, invokes the real SP1 withdrawal prover, and submits process_withdrawal.",
-    after_long_help = "CUSTODY:\n  Requires --operator-store with registered custody UTXOs (use deposit-to-solana). The spent-root is computed from the local tracked-UTXO sparse Merkle tree, not from a full canonical witness. The SP1 guest verifies the hash/public-value transition; it does not parse Dogecoin inputs/outputs or prove custody membership.\n\nSELECTION:\n  --request-index or --request-signature selects from Solana history. No recipient/amount overrides."
+    about = "Authorize, relay, confirm, and finalize a Dogecoin withdrawal through the output-only bridge",
+    long_about = "Loads an authoritative Solana withdrawal request, selects custody UTXOs, constructs the UTX0 payload, authorizes it atomically on-chain with request membership and output checks plus Wormhole VAA emission, obtains local manager signatures, broadcasts the signed Dogecoin transaction through electrs, waits for confirmation, and finalizes the bridge state.",
+    after_long_help = "The local manager service must be running (local_manager_service --listen 127.0.0.1:7071). Manager set index 0 is the deterministic local-regtest 5-of-7 fixture."
 )]
 struct Args {
-    #[arg(long, conflicts_with = "request_signature", required_unless_present = "request_signature")]
+    #[arg(
+        long,
+        conflicts_with = "request_signature",
+        required_unless_present = "request_signature"
+    )]
     request_index: Option<u64>,
-    #[arg(long, conflicts_with = "request_index", required_unless_present = "request_index")]
+    #[arg(
+        long,
+        conflicts_with = "request_index",
+        required_unless_present = "request_index"
+    )]
     request_signature: Option<Signature>,
-    #[arg(long, required = true)]
-    custody_address: String,
-    #[arg(long)]
-    change_address: Option<String>,
     #[arg(long, default_value_t = 1_000_000)]
     fee_sats: u64,
     #[arg(long, default_value_t = DUST_THRESHOLD_SATS)]
@@ -107,6 +136,10 @@ struct Args {
     doge_rpc_user: String,
     #[arg(long, default_value = "doge")]
     doge_rpc_password: String,
+    #[arg(long, default_value = "http://127.0.0.1:7071")]
+    manager_service_url: String,
+    #[arg(long, default_value = "http://127.0.0.1:3002")]
+    electrs_url: String,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     mine_blocks: u32,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -115,572 +148,2201 @@ struct Args {
     confirmation_timeout_secs: u64,
     #[arg(long, default_value_t = 500)]
     poll_interval_ms: u64,
-    #[arg(long, default_value = "../psy-bridge-sp1/target/release/gen-withdrawal-proof")]
-    gen_withdrawal_proof_bin: PathBuf,
-    #[arg(long, default_value = "/tmp/psy-bridge-withdrawal-proof")]
-    proof_output_dir: PathBuf,
     #[arg(long)]
-    operator_store: Option<PathBuf>,
+    operator_store: PathBuf,
     #[arg(long, default_value = "/tmp/doge-process-withdrawal-evidence.json")]
     evidence_path: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    manager_set_index: u32,
+
+    /// Enable live Manager signing. When `false` (the default, dry-run mode)
+    /// the relay does NOT register the withdrawal with the local Manager
+    /// service (so no new signatures are produced) and performs a single
+    /// Manager API fetch of whatever signatures already exist, verifying them
+    /// locally per input SIGHASH_ALL. Set `true` for the full live flow.
+    #[arg(long, default_value_t = false)]
+    manager_signing_enabled: bool,
+
+    /// Enable electrs broadcast. When `false` (the default, dry-run mode) the
+    /// assembled signed Dogecoin transaction is recorded and printed but never
+    /// sent to electrs, and the confirmation (Stage 4) and finalization
+    /// (Stage 5) stages are skipped. Set `true` to broadcast and finalize.
+    #[arg(long, default_value_t = false)]
+    broadcast_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
-struct IndexedRequest { index: u64, record: WithdrawalRequestRecord }
-struct DogeRpc { client: HttpClient, url: String, user: String, password: String }
+struct IndexedRequest {
+    index: u64,
+    record: WithdrawalRequestRecord,
+}
+
+struct DogeRpc {
+    client: HttpClient,
+    url: String,
+    user: String,
+    password: String,
+}
 
 impl DogeRpc {
-    fn new(url: String, user: String, password: String) -> Self { Self { client: HttpClient::new(), url, user, password } }
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let response = self.client.post(&self.url)
-            .basic_auth(&self.user, Some(&self.password))
-            .json(&json!({"jsonrpc":"1.0","id":"doge-local-withdrawal","method":method,"params":params}))
-            .send().await.with_context(|| format!("call Dogecoin RPC {method}"))?;
-        let status = response.status();
-        let body: Value = response.json().await.with_context(|| format!("decode Dogecoin RPC {method} (HTTP {status})"))?;
-        if !status.is_success() { bail!("Dogecoin RPC {method} returned HTTP {status}: {body}"); }
-        if let Some(err) = body.get("error").filter(|v| !v.is_null()) { bail!("Dogecoin RPC {method} error: {err}"); }
-        body.get("result").cloned().ok_or_else(|| anyhow!("Dogecoin RPC {method} missing result"))
+    fn new(url: String, user: String, password: String) -> Self {
+        Self {
+            client: HttpClient::new(),
+            url,
+            user,
+            password,
+        }
     }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let response = self
+            .client
+            .post(&self.url)
+            .basic_auth(&self.user, Some(&self.password))
+            .json(&json!({
+                "jsonrpc": "1.0",
+                "id": "doge-local-withdrawal",
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+            .with_context(|| format!("call Dogecoin RPC {method}"))?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .with_context(|| format!("decode Dogecoin RPC {method} (HTTP {status})"))?;
+        if !status.is_success() {
+            bail!("Dogecoin RPC {method} returned HTTP {status}: {body}");
+        }
+        if let Some(error) = body.get("error").filter(|value| !value.is_null()) {
+            bail!("Dogecoin RPC {method} error: {error}");
+        }
+        body.get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("Dogecoin RPC {method} missing result"))
+    }
+}
+
+#[derive(Debug)]
+struct PreparedTransaction {
+    utx0: Utx0UnlockPayload,
+    utx0_bytes: Vec<u8>,
+    unsigned_tx_bytes: Vec<u8>,
+    utx0_hash: [u8; 32],
+    unsigned_tx_hash: [u8; 32],
+    change_script_hash: Option<[u8; 20]>,
+    change_address: Option<String>,
+}
+
+#[derive(Debug)]
+struct RelayedTransaction {
+    raw_bytes: Vec<u8>,
+    raw_hash: [u8; 32],
+    final_txid: [u8; 32],
+    txid_text: String,
+    evidence: RelayEvidence,
+}
+
+#[derive(Debug)]
+struct RelayEvidence {
+    vaa_hash: [u8; 32],
+    signed_vaa_sha256: [u8; 32],
+    signed_vaa_bytes: usize,
+    signature_count: usize,
+    required: u32,
+    total: u32,
+    signer_indices: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterWithdrawalRequest {
+    emitter_chain: u16,
+    emitter_address_hex: String,
+    sequence: u64,
+    payload_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterWithdrawalResponse {
+    sequence: u64,
 }
 
 #[derive(Serialize)]
 struct Evidence {
-    schema: &'static str, completed: bool, mode: &'static str, limitations: Value,
-    request: Value, snapshot: Value, dogecoin: Value, proof: Value,
-    solana_process: Value, noop_shim: Value, operator_store: Value, custody: Value,
+    schema: String,
+    stage: String,
+    completed: bool,
+    request: Value,
+    authorize: Value,
+    relay: Value,
+    confirmation: Value,
+    finalize: Value,
+    custody: Value,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> { let args = Args::parse(); run(args).await }
+async fn main() -> Result<()> {
+    run(Args::parse()).await
+}
 
 async fn run(args: Args) -> Result<()> {
-    let expected_bridge_state = Pubkey::find_program_address(&[doge_bridge_client::constants::BRIDGE_STATE_SEED], &args.doge_bridge_program).0;
-    if let Some(provided) = args.bridge_state { if provided != expected_bridge_state { bail!("--bridge-state mismatch"); } }
+    if args.manager_set_index != 0 {
+        bail!(
+            "local manager service only supports deterministic manager set index 0, got {}",
+            args.manager_set_index
+        );
+    }
+
+    let bridge_state_pda = Pubkey::find_program_address(
+        &[doge_bridge_client::constants::BRIDGE_STATE_SEED],
+        &args.doge_bridge_program,
+    )
+    .0;
+    if let Some(provided) = args.bridge_state {
+        if provided != bridge_state_pda {
+            bail!("--bridge-state mismatch: expected {bridge_state_pda}, got {provided}");
+        }
+    }
 
     let operator = read_keypair(&args.operator_keypair, "operator")?;
     let payer = read_keypair(&args.payer_keypair, "payer")?;
     let client_config = BridgeClientConfigBuilder::new()
-        .rpc_url(args.solana_rpc_url.clone()).bridge_state_pda(expected_bridge_state)
-        .operator(clone_keypair(&operator)?).payer(clone_keypair(&payer)?)
-        .program_id(args.doge_bridge_program).pending_mint_program_id(args.pending_mint_program)
-        .txo_buffer_program_id(args.txo_buffer_program).generic_buffer_program_id(args.generic_buffer_program)
+        .rpc_url(args.solana_rpc_url.clone())
+        .bridge_state_pda(bridge_state_pda)
+        .operator(clone_keypair(&operator)?)
+        .payer(clone_keypair(&payer)?)
+        .program_id(args.doge_bridge_program)
+        .pending_mint_program_id(args.pending_mint_program)
+        .txo_buffer_program_id(args.txo_buffer_program)
+        .generic_buffer_program_id(args.generic_buffer_program)
         .manual_claim_program_id(args.manual_claim_program)
-        .wormhole_core_program_id(args.wormhole_core_program).wormhole_shim_program_id(args.wormhole_shim_program)
-        .build().context("build bridge client")?;
+        .wormhole_core_program_id(args.wormhole_core_program)
+        .wormhole_shim_program_id(args.wormhole_shim_program)
+        .build()
+        .context("build bridge client")?;
     let bridge_client = BridgeClient::with_config(client_config)?;
+    let solana_rpc =
+        RpcClient::new_with_commitment(args.solana_rpc_url.clone(), CommitmentConfig::confirmed());
+    let mut store = OperatorStore::open(&args.operator_store).context("open operator store")?;
 
-    let mut store: Option<OperatorStore> = args.operator_store.as_ref().map(OperatorStore::open).transpose().context("open operator store")?;
-    if store.is_none() { bail!("--operator-store is required for tracked custody UTXO mode"); }
-    let store = store.as_mut().unwrap();
+    // ── Stage 1: Load and verify ──────────────────────────────────────────
 
-    let history = load_indexed_requests(&args, expected_bridge_state).await?;
-    let selected = select_request(&history, args.request_index, args.request_signature.as_ref())?;
+    let history = load_indexed_requests(&args, bridge_state_pda).await?;
+    let selected = select_request(
+        &history,
+        args.request_index,
+        args.request_signature.as_ref(),
+    )?;
     let pre_snapshot = bridge_client.get_current_bridge_state().await?;
     ensure_next_unprocessed(&selected, pre_snapshot.next_processed_withdrawals_index)?;
+
     let fee = calcuate_withdrawal_fee(
-        selected.record.amount_sats, pre_snapshot.config_params.withdrawal_flat_fee_sats,
-        pre_snapshot.config_params.withdrawal_fee_rate_numerator, pre_snapshot.config_params.withdrawal_fee_rate_denominator,
-    ).context("calculate fee")?;
-    if fee.amount_after_fees == 0 || fee.fees_generated == 0 { bail!("invalid zero fee/net result"); }
-    let recipient_address = dogecoin_regtest_address(selected.record.address_type, selected.record.recipient_address)?;
+        selected.record.amount_sats,
+        pre_snapshot.config_params.withdrawal_flat_fee_sats,
+        pre_snapshot.config_params.withdrawal_fee_rate_numerator,
+        pre_snapshot.config_params.withdrawal_fee_rate_denominator,
+    )
+    .context("calculate withdrawal fee")?;
+    if fee.amount_after_fees == 0 {
+        bail!("withdrawal amount after fees is zero");
+    }
+    let recipient_address = dogecoin_regtest_address(
+        selected.record.address_type,
+        selected.record.recipient_address,
+    )?;
 
-    store.upsert_withdrawal_request(&store_request(&selected, fee.fees_generated, fee.amount_after_fees, OperatorStatus::Observed))?;
-    let snapshot_signature = bridge_client.execute_snapshot_withdrawals().await.context("snapshot_withdrawals")?;
-    let state = bridge_client.get_current_bridge_state().await.context("read bridge state after snapshot")?;
+    store.upsert_withdrawal_request(&store_request(
+        &selected,
+        fee.fees_generated,
+        fee.amount_after_fees,
+        OperatorStatus::Observed,
+    ))?;
+    let snapshot_signature = bridge_client
+        .execute_snapshot_withdrawals()
+        .await
+        .context("snapshot_withdrawals")?;
+    let state = bridge_client
+        .get_current_bridge_state()
+        .await
+        .context("read bridge state after snapshot")?;
     verify_snapshot(&state, &selected)?;
-    store.upsert_withdrawal_request(&store_request(&selected, fee.fees_generated, fee.amount_after_fees, OperatorStatus::Snapshotted))?;
+    store.upsert_withdrawal_request(&store_request(
+        &selected,
+        fee.fees_generated,
+        fee.amount_after_fees,
+        OperatorStatus::Snapshotted,
+    ))?;
 
-    let doge = DogeRpc::new(args.doge_rpc_url.clone(), args.doge_rpc_user.clone(), args.doge_rpc_password.clone());
+    let doge = DogeRpc::new(
+        args.doge_rpc_url.clone(),
+        args.doge_rpc_user.clone(),
+        args.doge_rpc_password.clone(),
+    );
     verify_regtest(&doge).await?;
 
-    // ── Verify local spent root consistency with bridge state ──
-    let all_utxos = store.list_custody_utxos().context("list all custody UTXOs")?;
-    let spent_indices: Vec<u64> = all_utxos.iter()
-        .filter(|u| u.status == CustodyUtxoStatus::Spent)
-        .map(|u| u.leaf_index)
-        .collect();
-    let local_leaves = custody_ops::rebuild_merkle_leaves(&spent_indices);
-    let local_root = if local_leaves.is_empty() {
-        psy_bridge_core::crypto::hash::sha256::SHA256_ZERO_HASHES[
-            psy_bridge_core::txo_constants::TXO_MERKLE_INDEX_TOTAL_BITS
-        ]
-    } else {
-        custody_ops::compute_sparse_merkle_root(&local_leaves)
+    // Select custody UTXOs — operator chooses which UTXOs to spend.
+    // No spent-tree computation: the bridge no longer tracks which custody
+    // inputs are spent (output-only authorization model).
+    let all_utxos = store.list_custody_utxos().context("list custody UTXOs")?;
+    let reservation_id = format!("withdrawal-{}", selected.index);
+    let required_sats = fee
+        .amount_after_fees
+        .checked_add(args.fee_sats)
+        .ok_or_else(|| anyhow!("required custody amount overflow"))?;
+    let reservation = store
+        .reserve_custody_utxos(&reservation_id, required_sats)
+        .map_err(|error| anyhow!("custody UTXO reservation failed: {error}"))?;
+    let reserved_utxos = reservation.utxos.clone();
+    let selected_sats = reserved_utxos.iter().try_fold(0u64, |sum, utxo| {
+        sum.checked_add(utxo.amount_sats)
+            .ok_or_else(|| anyhow!("selected custody value overflow"))
+    })?;
+    let plan = plan_custody_transaction(
+        selected_sats,
+        fee.amount_after_fees,
+        args.fee_sats,
+        args.dust_threshold_sats,
+    )
+    .map_err(|error| {
+        let _ = store.release_reservation(&reservation_id);
+        error
+    })?;
+
+    let manager_set = local_regtest_manager_set();
+    let prepared = build_prepared_transaction(
+        &selected,
+        &reserved_utxos,
+        &plan,
+        bridge_state_pda,
+        args.manager_set_index,
+        &manager_set,
+        &recipient_address,
+    )?;
+
+    let request_start = selected.index;
+    let request_end = request_start
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("withdrawal request index overflow"))?;
+
+    // Compute intent_hash per the v3 spec (no spent-tree fields).
+    // canonical_manager_set_bytes = MANAGER_SET_PREFIX || compressed_pubkeys,
+    // matching the on-chain `manager_set.manager_set` field exactly (234 bytes).
+    let canonical_manager_set_bytes = {
+        let mut buf = Vec::with_capacity(3 + manager_set.pubkeys.len() * 33);
+        buf.push(0x01); // Type tag (on-chain MANAGER_SET_PREFIX[0])
+        buf.push(manager_set.m);
+        buf.push(manager_set.n);
+        for pk in &manager_set.pubkeys {
+            buf.extend_from_slice(pk);
+        }
+        buf
     };
-    if local_root != state.spent_txo_tree_root {
-        eprintln!(
-            "warning: local spent tree root {} does not match bridge state root {}; bridge may have processed withdrawals outside this utility",
-            hex::encode(local_root), hex::encode(state.spent_txo_tree_root)
+    let intent_hash = compute_withdrawal_intent_hash(
+        request_start,
+        request_end,
+        &canonical_manager_set_bytes,
+        &prepared.utx0_hash,
+        &prepared.unsigned_tx_hash,
+    );
+
+    // Build burn-request Merkle proofs: leaf preimages + 32-level
+    // FixedMerkleAppendTree membership paths against the snapshot root.
+    let burn_request_proofs =
+        build_burn_request_proofs(&history, &state, request_start, request_end)?;
+    let burn_request_proof_bytes =
+        instructions::serialize_withdrawal_request_proofs(&burn_request_proofs);
+    let request_proof_buffer = create_generic_buffer_with_writer(
+        &solana_rpc,
+        &payer,
+        &operator,
+        args.generic_buffer_program,
+        &burn_request_proof_bytes,
+    )
+    .await?;
+    verify_generic_buffer(
+        &solana_rpc,
+        request_proof_buffer,
+        args.generic_buffer_program,
+        operator.pubkey(),
+        &burn_request_proof_bytes,
+    )
+    .await?;
+
+    // ── Stage 2: Authorize ─────────────────────────────────────────────────
+
+    // Create generic buffer with the exact UTX0 payload.
+    let utx0_buffer = create_generic_buffer(
+        &solana_rpc,
+        &payer,
+        args.generic_buffer_program,
+        &prepared.utx0_bytes,
+    )
+    .await?;
+    verify_generic_buffer(
+        &solana_rpc,
+        utx0_buffer,
+        args.generic_buffer_program,
+        payer.pubkey(),
+        &prepared.utx0_bytes,
+    )
+    .await?;
+
+    // Derive the manager-set PDA (DelegatedManagerSet program).
+    let delegated_manager_set_program = Pubkey::from_str(DELEGATED_MANAGER_SET_PROGRAM_ID)
+        .context("parse DelegatedManagerSet program ID")?;
+    let (manager_set_account, _) = Pubkey::find_program_address(
+        &[
+            b"manager_set",
+            &DOGECOIN_CHAIN_ID.to_be_bytes(),
+            &args.manager_set_index.to_be_bytes(),
+        ],
+        &delegated_manager_set_program,
+    );
+
+    let authorize_ix = instructions::authorize_withdrawal(
+        args.doge_bridge_program,
+        operator.pubkey(),
+        utx0_buffer,
+        request_proof_buffer,
+        manager_set_account,
+        args.wormhole_shim_program,
+        args.wormhole_core_program,
+        request_start,
+        request_end,
+        args.manager_set_index,
+        intent_hash,
+    );
+    let (fee_collector_pda, _) =
+        Pubkey::find_program_address(&[b"fee_collector"], &args.wormhole_core_program);
+    ensure_operator_authorize_funding(&solana_rpc, &payer, &operator).await?;
+    let fee_prepay_ix = system_instruction::transfer(
+        &operator.pubkey(),
+        &fee_collector_pda,
+        WORMHOLE_FEE_PREPAY_LAMPORTS,
+    );
+    let authorize_signature = send_solana_transaction(
+        &solana_rpc,
+        &payer,
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(AUTHORIZE_COMPUTE_UNITS),
+            fee_prepay_ix,
+            authorize_ix,
+        ],
+        &[&operator],
+    )
+    .await
+    .context("submit authorize_withdrawal")?;
+    let authorize_meta = solana_rpc
+        .get_transaction(&authorize_signature, UiTransactionEncoding::Base64)
+        .await
+        .context("fetch authorize_withdrawal transaction")?;
+
+    // Verify the bridge state was not mutated by authorization (only the
+    // active intent hash and pending PDA should change).
+    let post_authorize_state = bridge_client
+        .get_current_bridge_state()
+        .await
+        .context("read bridge state after authorize_withdrawal")?;
+    verify_authorize_state_unchanged(&state, &post_authorize_state, intent_hash)?;
+
+    // Verify the VAA was emitted via the pinned Wormhole CPI.
+    let noop =
+        find_noop_message_for_programs(&args, bridge_state_pda, &authorize_signature).await?;
+    if noop.emitter != bridge_state_pda {
+        bail!("noop emitter mismatch");
+    }
+    if noop.payer != operator.pubkey() {
+        bail!(
+            "noop payer mismatch: expected operator {}, got {}",
+            operator.pubkey(),
+            noop.payer
         );
     }
-    // ── Tracked custody UTXO selection ──
-    let reservation_id = format!("withdrawal-{}", selected.index);
-    let reservation = store.reserve_custody_utxos(&reservation_id, fee.amount_after_fees + args.fee_sats)
-        .map_err(|e| anyhow!("custody UTXO reservation failed: {e}"))?;
-    let selected_sats: u64 = reservation.utxos.iter().map(|u| u.amount_sats).sum();
-    let reserved_utxos = reservation.utxos.clone();
-
-    let plan = plan_custody_transaction(selected_sats, fee.amount_after_fees, args.fee_sats, args.dust_threshold_sats)
-        .map_err(|e| { let _ = store.release_reservation(&reservation_id); e })?;
-
-    // ── Raw transaction construction ──
-    let amount_number = sats_to_doge_number(plan.recipient_sats)?;
-    let change_address = args.change_address.as_ref();
-    let mut output_map = serde_json::Map::new();
-    output_map.insert(recipient_address.clone(), json!(amount_number));
-    let change_number = if plan.change_sats != 0 {
-        let addr = change_address.ok_or_else(|| {
-            let _ = store.release_reservation(&reservation_id);
-            anyhow!("change of {}-sat but no --change-address", plan.change_sats)
-        })?;
-        if *addr == recipient_address {
-            let _ = store.release_reservation(&reservation_id);
-            bail!("--change-address must differ from recipient");
-        }
-        let cn = sats_to_doge_number(plan.change_sats)?;
-        output_map.insert(addr.clone(), json!(cn));
-        Some(cn)
-    } else { None };
-
-    // Build inputs with reversed txid hex for Dogecoin Core RPC convention
-    let inputs: Vec<Value> = reserved_utxos.iter().map(|utxo| {
-        let mut txid_display = hex::encode(utxo.txid);
-        // Reverse to get Dogecoin Core display order (little-endian hex)
-        let txid_rev: String = txid_display.as_bytes().chunks(2).rev()
-            .map(|c| unsafe { std::str::from_utf8_unchecked(c) }).collect();
-        json!({"txid": txid_rev, "vout": utxo.vout})
-    }).collect();
-
-    let outputs = Value::Object(output_map);
-    let unsigned_hex = doge.call("createrawtransaction", json!([inputs, outputs])).await?
-        .as_str().ok_or_else(|| anyhow!("createrawtransaction result not hex"))?.to_owned();
-
-    // ── Validate unsigned transaction ──
-    let decoded = doge.call("decoderawtransaction", json!([unsigned_hex])).await?;
-    let expected_input_refs: Vec<(String, u32)> = reserved_utxos.iter().map(|utxo| {
-        let mut txid_display = hex::encode(utxo.txid);
-        let txid_rev: String = txid_display.as_bytes().chunks(2).rev()
-            .map(|c| unsafe { std::str::from_utf8_unchecked(c) }).collect();
-        (txid_rev, utxo.vout)
-    }).collect();
-    validate_decoded_custody_transaction(&decoded, &expected_input_refs, &recipient_address,
-        change_address.map(|s| s.as_str()), &plan, selected_sats)?;
-
-    // ── Sign ──
-    let sign_inputs: Vec<Value> = reserved_utxos.iter().map(|utxo| {
-        let mut txid_display = hex::encode(utxo.txid);
-        let txid_rev: String = txid_display.as_bytes().chunks(2).rev()
-            .map(|c| unsafe { std::str::from_utf8_unchecked(c) }).collect();
-        json!({"txid": txid_rev, "vout": utxo.vout, "scriptPubKey": utxo.script_pubkey_hex,
-               "amount": sats_to_doge_json(utxo.amount_sats).unwrap_or(Value::Null)})
-    }).collect();
-
-    let signed = doge.call("signrawtransaction", json!([unsigned_hex, sign_inputs])).await?;
-    if signed.get("complete").and_then(Value::as_bool) != Some(true) {
-        let _ = store.release_reservation(&reservation_id);
-        bail!("signrawtransaction incomplete: {:?}", signed.get("errors"));
+    if noop.consistency_level != 1 {
+        bail!(
+            "noop consistency level is {}, expected 1",
+            noop.consistency_level
+        );
     }
-    let signed_hex = signed.get("hex").and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing signed hex"))?.to_owned();
-    let signed_bytes = hex::decode(&signed_hex).context("decode signed tx")?;
-    let raw_hash = hash_impl_sha256_bytes(&signed_bytes);
-
-    store.upsert_dogecoin_transaction(&DogecoinTransaction {
-        raw_hash, txid: None, raw_transaction: Some(signed_bytes.clone()),
-        status: OperatorStatus::Signed, block_hash: None, block_height: None, confirmations: 0,
-    })?;
-
-    // ── Broadcast ──
-    let txid_text = doge.call("sendrawtransaction", json!([signed_hex])).await?
-        .as_str().ok_or_else(|| anyhow!("sendrawtransaction result not txid"))?.to_owned();
-    let doge_txid = decode_displayed_hash32("Dogecoin txid", &txid_text)?;
-    store.mark_reservation_broadcast(&reservation_id, &doge_txid)?;
-
-    store.upsert_dogecoin_transaction(&DogecoinTransaction {
-        raw_hash, txid: Some(doge_txid), raw_transaction: Some(signed_bytes.clone()),
-        status: OperatorStatus::Broadcast, block_hash: None, block_height: None, confirmations: 0,
-    })?;
-
-    let mining_address = doge.call("getnewaddress", json!([])).await?
-        .as_str().ok_or_else(|| anyhow!("getnewaddress failed"))?.to_owned();
-    doge.call("generatetoaddress", json!([args.mine_blocks, mining_address])).await?;
-    let verbose = wait_for_doge_confirmation(&doge, &txid_text, args.min_confirmations,
-        Duration::from_secs(args.confirmation_timeout_secs), Duration::from_millis(args.poll_interval_ms)).await?;
-
-    let (withdrawal_vout, paid_sats) = extract_vout_and_sats(&verbose, &recipient_address)?;
-    if paid_sats != fee.amount_after_fees {
-        bail!("confirmed payment {paid_sats} sats, expected {}", fee.amount_after_fees);
+    if noop.sighash != prepared.utx0_hash {
+        bail!("noop UTX0 hash mismatch");
     }
-    let raw_hex = doge.call("getrawtransaction", json!([txid_text, false])).await?
-        .as_str().ok_or_else(|| anyhow!("getrawtransaction not hex"))?.to_owned();
-    let raw_bytes = hex::decode(raw_hex).context("decode confirmed raw tx")?;
-    if raw_bytes != signed_bytes { bail!("confirmed tx differs from signed bytes"); }
-    let confirmations = verbose.get("confirmations").and_then(Value::as_u64).unwrap_or(0) as u32;
-    let block_hash = verbose.get("blockhash").and_then(Value::as_str)
-        .map(|v| decode_displayed_hash32("block hash", v)).transpose()?;
-    let block_height = verbose.get("height").and_then(Value::as_u64).map(|h| h as u32);
-    let tx_index_in_block = verbose.get("blockindex").and_then(Value::as_u64).unwrap_or(0) as u16;
+    if noop.doge_tx_bytes != prepared.utx0_bytes {
+        bail!("noop shim did not emit the exact prepared UTX0 payload");
+    }
+    let sequence = noop.nonce as u64;
 
-    store.upsert_dogecoin_transaction(&DogecoinTransaction {
-        raw_hash, txid: Some(doge_txid), raw_transaction: Some(raw_bytes.clone()),
-        status: OperatorStatus::Confirmed, block_hash, block_height, confirmations,
-    })?;
+    // Verify the pending PDA was created with status PENDING_VAA.
+    let pending_pda = pending_withdrawal_pda(args.doge_bridge_program, &intent_hash);
+    let pending_authorized =
+        read_pending_withdrawal(&solana_rpc, pending_pda, args.doge_bridge_program).await?;
+    verify_pending_authorized(
+        &pending_authorized,
+        intent_hash,
+        request_start,
+        request_end,
+        args.manager_set_index,
+        prepared.utx0_hash,
+        prepared.unsigned_tx_hash,
+    )?;
+    store.set_withdrawal_request_status(selected.index, OperatorStatus::Constructed)?;
 
-    let sighash = hash_impl_sha256_bytes(&raw_bytes);
-    if sighash != raw_hash { bail!("raw tx hash changed after confirmation"); }
+    // ── Stage 3: Relay (dry-run by default) ───────────────────────────────
 
-    // ── Compute spent-root transition ──
-    let old_spent_root = state.spent_txo_tree_root;
-    let spent_combined_indices: Vec<u64> = reserved_utxos.iter().map(|u| u.leaf_index).collect();
-    let existing = custody_ops::rebuild_merkle_leaves(
-        &store.list_custody_utxos().context("list all custody UTXOs")?.iter()
-            .filter(|u| u.status == CustodyUtxoStatus::Spent)
-            .map(|u| u.leaf_index)
-            .collect::<Vec<_>>()
-    );
-    let leaf_updates = custody_ops::compute_updated_leaf_values(&spent_combined_indices, &existing);
-    let new_spent_root = custody_ops::compute_sparse_merkle_root(
-        &{ let mut all = existing; all.extend(leaf_updates); all }
-    );
-
-    // ── Register change output ──
-    let change_utxo = if plan.change_sats != 0 {
-        let addr = change_address.unwrap();
-        let change_vout = verbose.get("vout").and_then(Value::as_array).and_then(|vouts|
-            vouts.iter().position(|v| {
-                let spk = v.get("scriptPubKey").unwrap_or(&Value::Null);
-                spk.get("address").and_then(Value::as_str) == Some(addr)
-                    || spk.get("addresses").and_then(Value::as_array)
-                        .map(|addrs| addrs.iter().any(|a| a.as_str() == Some(addr))).unwrap_or(false)
-            })
-        ).map(|i| i as u32);
-
-        match change_vout {
-            Some(vout) => {
-                let change_leaf = custody_ops::compute_combined_index(block_height.unwrap_or(0), tx_index_in_block, vout as u16);
-                let change_spk = verbose.get("vout").and_then(Value::as_array)
-                    .and_then(|vouts| vouts.iter().find(|v| v.get("n").and_then(Value::as_u64) == Some(vout as u64)))
-                    .and_then(|v| v.get("scriptPubKey")).and_then(|spk| spk.get("hex")).and_then(Value::as_str)
-                    .unwrap_or("").to_owned();
-                Some(CustodyUtxo {
-                    txid: doge_txid, vout, amount_sats: plan.change_sats,
-                    script_pubkey_hex: change_spk, custody_address: addr.clone(),
-                    key_reference: "bridge-custody-wallet#0".into(),
-                    confirmation_block_hash: block_hash, confirmation_height: block_height,
-                    confirmations, leaf_index: change_leaf, status: CustodyUtxoStatus::Available,
-                    reservation_id: None, spend_txid: None,
-                    source_deposit_txid: None, source_solana_signature: None,
-                    spend_request_index: None, spend_process_signature: None,
-                })
-            }
-            None => { eprintln!("warning: change output not located"); None }
-        }
-    } else { None };
-
-    store.finalize_custody_spend(&reservation_id, change_utxo.as_ref().unwrap_or(&reserved_utxos[0]), &doge_txid)
-        .map_err(|e| anyhow!("finalize custody spend failed: {e}"))?;
-
-    // ── SP1 proof ──
-    let new_return_output = if let Some(ref change) = change_utxo {
-        PsyReturnTxOutput { sighash, output_index: change.vout as u64, amount_sats: change.amount_sats }
+    let http = HttpClient::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build manager/electrs HTTP client")?;
+    if args.manager_signing_enabled {
+        register_local_withdrawal(
+            &http,
+            &args.manager_service_url,
+            bridge_state_pda,
+            sequence,
+            &prepared.utx0_bytes,
+        )
+        .await?;
     } else {
-        PsyReturnTxOutput { sighash, output_index: withdrawal_vout as u64, amount_sats: paid_sats }
+        println!("[dry-run] manager signing skipped (manager_signing_enabled=false); not registering withdrawal with the Manager service");
+    }
+    let relayed = relay_and_broadcast(
+        &http,
+        &args.manager_service_url,
+        &args.electrs_url,
+        bridge_state_pda,
+        sequence,
+        args.manager_set_index,
+        &manager_set,
+        &prepared,
+        Duration::from_millis(args.poll_interval_ms),
+        Duration::from_secs(args.confirmation_timeout_secs),
+        args.manager_signing_enabled,
+        args.broadcast_enabled,
+    )
+    .await?;
+
+    store.upsert_dogecoin_transaction(&DogecoinTransaction {
+        raw_hash: relayed.raw_hash,
+        txid: Some(relayed.final_txid),
+        raw_transaction: Some(relayed.raw_bytes.clone()),
+        status: OperatorStatus::Signed,
+        block_hash: None,
+        block_height: None,
+        confirmations: 0,
+    })?;
+    store.upsert_process_withdrawal(&ProcessWithdrawal {
+        solana_signature: authorize_signature.to_string(),
+        solana_slot: authorize_meta.slot,
+        block_time: authorize_meta.block_time,
+        request_start_index: request_start,
+        request_end_index: request_end,
+        snapshot_root: state.withdrawal_snapshot.requested_withdrawals_tree_root,
+        dogecoin_raw_hash: relayed.raw_hash,
+        return_output_index: 0,
+        return_output_amount_sats: 0,
+        old_spent_txo_root: [0u8; 32],
+        new_spent_txo_root: [0u8; 32],
+        status: OperatorStatus::Signed,
+    })?;
+    store.link_reservation_to_withdrawal(
+        &reservation_id,
+        Some(selected.index),
+        Some(&authorize_signature.to_string()),
+    )?;
+
+    if !args.broadcast_enabled {
+        let evidence = Evidence {
+            schema: "doge-local-process-withdrawal-v3-output-only".into(),
+            stage: "SIGNED_NOT_BROADCAST".into(),
+            completed: false,
+            request: json!({
+                "index": selected.index,
+                "burnSignature": selected.record.signature.to_string(),
+                "slot": selected.record.slot,
+                "user": selected.record.user_pubkey.to_string(),
+                "grossAmountSats": selected.record.amount_sats,
+                "feeAmountSats": fee.fees_generated,
+                "recipientAmountSats": fee.amount_after_fees,
+                "addressType": selected.record.address_type,
+                "recipientPayloadHex": hex::encode(selected.record.recipient_address),
+                "recipientRegtestAddress": recipient_address,
+                "snapshotSignature": snapshot_signature.to_string(),
+            }),
+            authorize: json!({
+                "signature": authorize_signature.to_string(),
+                "slot": authorize_meta.slot,
+                "pendingPda": pending_pda.to_string(),
+                "intentHashHex": hex::encode(intent_hash),
+                "utx0HashHex": hex::encode(prepared.utx0_hash),
+                "unsignedTxHashHex": hex::encode(prepared.unsigned_tx_hash),
+                "utx0Buffer": utx0_buffer.to_string(),
+                "requestStart": request_start,
+                "requestEnd": request_end,
+                "managerSetIndex": args.manager_set_index,
+                "inputCount": prepared.utx0.inputs.len(),
+                "noopVerified": true,
+                "noopProgram": noop.emitter.to_string(),
+                "sequence": sequence,
+                "activeIntentHashHex": hex::encode(post_authorize_state.active_withdrawal_intent_hash),
+            }),
+            relay: json!({
+                "managerServiceUrl": args.manager_service_url,
+                "electrsUrl": args.electrs_url,
+                "vaaHashHex": hex::encode(relayed.evidence.vaa_hash),
+                "vaaSequence": sequence,
+                "signedVaaBytes": relayed.evidence.signed_vaa_bytes,
+                "signedVaaSha256Hex": hex::encode(relayed.evidence.signed_vaa_sha256),
+                "managerSetIndex": args.manager_set_index,
+                "signatureCount": relayed.evidence.signature_count,
+                "quorum": relayed.evidence.required,
+                "managerTotal": relayed.evidence.total,
+                "signerIndices": relayed.evidence.signer_indices,
+                "txid": relayed.txid_text,
+                "finalTxidInternalHex": hex::encode(relayed.final_txid),
+                "signedRawBytes": relayed.raw_bytes.len(),
+                "broadcast": false,
+                "signedRawSha256Hex": hex::encode(relayed.raw_hash),
+            }),
+            confirmation: json!({"status": "NOT_ATTEMPTED"}),
+            finalize: json!({
+                "status": "NOT_ATTEMPTED",
+                "instruction": "finalize_confirmed_withdrawal",
+                "discriminator": 17,
+                "finalizeConfirmed": false,
+            }),
+            custody: json!({
+                "operatorStore": args.operator_store,
+                "reservationId": reservation_id,
+                "selectedTotalSats": selected_sats,
+                "minerFeeSats": args.fee_sats,
+                "changeRegistered": false,
+            }),
+        };
+        write_evidence(&args.evidence_path, &evidence)?;
+    }
+    // Dry-run: stop after the relay/signed-transaction recording.
+    if !args.broadcast_enabled {
+        println!(
+            "[dry-run] broadcast skipped (broadcast_enabled=false); signed tx hex: {}",
+            hex::encode(&relayed.raw_bytes)
+        );
+        println!("[dry-run] local txid: {}", hex::encode(relayed.final_txid));
+        println!("[dry-run] confirmation (Stage 4) and finalization (Stage 5) skipped");
+        return Ok(());
+    }
+    store.mark_reservation_broadcast(&reservation_id, &relayed.final_txid)?;
+    store.upsert_dogecoin_transaction(&DogecoinTransaction {
+        raw_hash: relayed.raw_hash,
+        txid: Some(relayed.final_txid),
+        raw_transaction: Some(relayed.raw_bytes.clone()),
+        status: OperatorStatus::Broadcast,
+        block_hash: None,
+        block_height: None,
+        confirmations: 0,
+    })?;
+    store.set_process_withdrawal_status(
+        &authorize_signature.to_string(),
+        OperatorStatus::Broadcast,
+    )?;
+    store.set_withdrawal_request_status(selected.index, OperatorStatus::Broadcast)?;
+
+    // ── Stage 4: Confirm ───────────────────────────────────────────────────
+
+    let mining_address = doge
+        .call("getnewaddress", json!([]))
+        .await?
+        .as_str()
+        .ok_or_else(|| anyhow!("getnewaddress result is not a string"))?
+        .to_owned();
+    doge.call(
+        "generatetoaddress",
+        json!([args.mine_blocks, mining_address]),
+    )
+    .await?;
+    let verbose = wait_for_doge_confirmation(
+        &doge,
+        &relayed.txid_text,
+        args.min_confirmations,
+        Duration::from_secs(args.confirmation_timeout_secs),
+        Duration::from_millis(args.poll_interval_ms),
+    )
+    .await?;
+    let (withdrawal_vout, paid_sats) = extract_vout_and_sats(&verbose, &recipient_address)?;
+    if withdrawal_vout != 0 || paid_sats != fee.amount_after_fees {
+        bail!(
+            "confirmed recipient output is vout {withdrawal_vout} with {paid_sats} sats; expected vout 0 with {} sats",
+            fee.amount_after_fees
+        );
+    }
+    let confirmed_raw_hex = doge
+        .call("getrawtransaction", json!([relayed.txid_text, false]))
+        .await?
+        .as_str()
+        .ok_or_else(|| anyhow!("getrawtransaction result is not hex"))?
+        .to_owned();
+    let confirmed_raw_bytes =
+        hex::decode(confirmed_raw_hex).context("decode confirmed raw Dogecoin transaction")?;
+    if confirmed_raw_bytes != relayed.raw_bytes {
+        bail!("confirmed Dogecoin transaction differs from the manager-signed bytes");
+    }
+    let final_txid = double_sha256(&confirmed_raw_bytes);
+    if final_txid != relayed.final_txid {
+        bail!("confirmed Dogecoin transaction txid changed after broadcast");
+    }
+    let confirmations = verbose
+        .get("confirmations")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let (block_hash, block_height, tx_index_in_block, block_txids) =
+        confirmed_position(&doge, &verbose, &relayed.txid_text).await?;
+
+    // Register the change UTXO (custody management — operator responsibility).
+    let change_utxo = if let (Some(change_hash), Some(change_address)) = (
+        prepared.change_script_hash,
+        prepared.change_address.as_ref(),
+    ) {
+        let (change_vout, change_sats) = extract_vout_and_sats(&verbose, change_address)?;
+        if change_vout != 1 || change_sats != plan.change_sats {
+            bail!(
+                "confirmed change output is vout {change_vout} with {change_sats} sats; expected vout 1 with {} sats",
+                plan.change_sats
+            );
+        }
+        let change_vout_u16 = u16::try_from(change_vout)
+            .map_err(|_| anyhow!("change vout {change_vout} exceeds combined-index width"))?;
+        let change_leaf =
+            custody_ops::compute_combined_index(block_height, tx_index_in_block, change_vout_u16);
+        Some(CustodyUtxo {
+            txid: final_txid,
+            vout: change_vout,
+            amount_sats: plan.change_sats,
+            script_pubkey_hex: hex::encode(p2sh_script_pubkey(&change_hash)),
+            custody_address: change_address.clone(),
+            key_reference: "wormhole-local-manager-set-0".into(),
+            confirmation_block_hash: Some(block_hash),
+            confirmation_height: Some(block_height),
+            confirmations,
+            leaf_index: change_leaf,
+            status: CustodyUtxoStatus::Available,
+            reservation_id: None,
+            spend_txid: None,
+            source_deposit_txid: None,
+            source_solana_signature: Some(authorize_signature.to_string()),
+            spend_request_index: None,
+            spend_process_signature: None,
+            original_recipient_address: [0u8; 32],
+        })
+    } else {
+        None
     };
 
-    let new_index = state.next_processed_withdrawals_index.checked_add(1)
-        .ok_or_else(|| anyhow!("index overflow"))?;
-    let expected_public_values = state.get_expected_public_inputs_for_withdrawal_proof(
-        &new_return_output, new_spent_root, new_index,
-    );
-    let proof_path = args.proof_output_dir.join(PROOF_FILENAME);
-    let pubvals_path = args.proof_output_dir.join(PUBLIC_VALUES_FILENAME);
-    remove_stale(&proof_path)?; remove_stale(&pubvals_path)?;
-    let prover_stdout = run_withdrawal_prover(&args, &state, &new_return_output, new_spent_root, new_index).await?;
-    let (proof, public_values) = validate_withdrawal_artifacts(&proof_path, &pubvals_path, expected_public_values, &prover_stdout)?;
-
-    // ── Solana process ──
-    let solana_rpc = RpcClient::new_with_commitment(args.solana_rpc_url.clone(), CommitmentConfig::confirmed());
-    let buffer = create_generic_buffer(&solana_rpc, &payer, args.generic_buffer_program, &raw_bytes).await?;
-    let process_ix = instructions::process_withdrawal(
-        args.doge_bridge_program, payer.pubkey(), buffer, args.wormhole_shim_program, args.wormhole_core_program,
-        proof, new_return_output.clone(), new_spent_root, new_index,
-    );
-
-    // Pre-pay Wormhole fee: Core Bridge requires fee_collector to have received >= fee lamports
-    // since the last post_message. Transfer 1000 lamports (fee is 10 on devnet) in the same tx.
-    let (fee_collector_pda, _) = Pubkey::find_program_address(&[b"fee_collector"], &args.wormhole_core_program);
-    let fee_prepay_ix = system_instruction::transfer(&payer.pubkey(), &fee_collector_pda, 1000);
-
-    let process_signature = send_solana_transaction(&solana_rpc, &payer,
-        &[ComputeBudgetInstruction::set_compute_unit_limit(PROCESS_COMPUTE_UNITS), fee_prepay_ix, process_ix], &[],
-    ).await.context("submit process_withdrawal")?;
-
-    let process_sig_str = process_signature.to_string();
-    store.link_reservation_to_withdrawal(&reservation_id, Some(selected.index), Some(process_sig_str.as_str()))?;
-
-    let post_state = bridge_client.get_current_bridge_state().await.context("read post-process state")?;
-    if post_state.next_processed_withdrawals_index != new_index
-        || post_state.last_return_output.sighash != sighash
-        || post_state.last_return_output.output_index != new_return_output.output_index
-        || post_state.last_return_output.amount_sats != new_return_output.amount_sats
-        || post_state.spent_txo_tree_root != new_spent_root
-    { bail!("process_withdrawal did not produce expected bridge state transition"); }
-
-    // ── Noop shim verification ──
-    let monitor = NoopShimMonitor::new(
-        NoopShimMonitorConfig::new(args.solana_rpc_url.clone(), expected_bridge_state)
-            .noop_shim_program_id(args.wormhole_shim_program).batch_size(50),
-    )?;
-    let noop = find_noop_message(&monitor, &process_signature).await?;
-    if noop.emitter != expected_bridge_state { bail!("noop emitter mismatch"); }
-    if noop.payer != payer.pubkey() { bail!("noop payer mismatch"); }
-    if noop.consistency_level != 1 { bail!("noop consistency level {}", noop.consistency_level); }
-    if noop.sighash != sighash { bail!("noop sighash mismatch"); }
-    if noop.doge_tx_bytes != raw_bytes { bail!("noop doge_tx_bytes mismatch"); }
-
-    let process_meta = solana_rpc.get_transaction(&process_signature, UiTransactionEncoding::Base64).await
-        .context("fetch process transaction")?;
-
-    store.upsert_process_withdrawal(&ProcessWithdrawal {
-        solana_signature: process_signature.to_string(), solana_slot: process_meta.slot,
-        block_time: process_meta.block_time, request_start_index: selected.index,
-        request_end_index: selected.index + 1,
-        snapshot_root: state.withdrawal_snapshot.requested_withdrawals_tree_root,
-        dogecoin_raw_hash: raw_hash, return_output_index: new_return_output.output_index,
-        return_output_amount_sats: new_return_output.amount_sats,
-        old_spent_txo_root: old_spent_root, new_spent_txo_root: new_spent_root,
+    store.upsert_dogecoin_transaction(&DogecoinTransaction {
+        raw_hash: relayed.raw_hash,
+        txid: Some(final_txid),
+        raw_transaction: Some(confirmed_raw_bytes.clone()),
         status: OperatorStatus::Confirmed,
+        block_hash: Some(block_hash),
+        block_height: Some(block_height),
+        confirmations,
     })?;
-    store.map_process_range_to_txid(&process_signature.to_string(), &doge_txid)?;
+
+    // ── Stage 5: Finalize ──────────────────────────────────────────────────
+
+    // Compute the transaction Merkle branch for inclusion proof.
+    let tx_merkle_branch = compute_tx_merkle_branch(&block_txids, tx_index_in_block)?;
+
+    // Create generic buffer with the exact signed transaction bytes.
+    let signed_tx_buffer = create_generic_buffer(
+        &solana_rpc,
+        &payer,
+        args.generic_buffer_program,
+        &confirmed_raw_bytes,
+    )
+    .await?;
+    verify_generic_buffer(
+        &solana_rpc,
+        signed_tx_buffer,
+        args.generic_buffer_program,
+        payer.pubkey(),
+        &confirmed_raw_bytes,
+    )
+    .await?;
+
+    let finalize_ix = instructions::finalize_confirmed_withdrawal(
+        args.doge_bridge_program,
+        payer.pubkey(),
+        signed_tx_buffer,
+        intent_hash,
+        &tx_merkle_branch,
+        tx_index_in_block as u32,
+        block_height,
+    );
+    let finalize_signature = send_solana_transaction(&solana_rpc, &payer, &[finalize_ix], &[])
+        .await
+        .context("submit permissionless finalize_confirmed_withdrawal discriminator 17")?;
+    let finalize_meta = solana_rpc
+        .get_transaction(&finalize_signature, UiTransactionEncoding::Base64)
+        .await
+        .context("fetch finalize_confirmed_withdrawal transaction")?;
+
+    let finalized_state = bridge_client
+        .get_current_bridge_state()
+        .await
+        .context("read bridge state after finalize_confirmed_withdrawal")?;
+    verify_finalized_state_advanced(&finalized_state, &state, request_end, final_txid)?;
+    let pending_finalized =
+        read_pending_withdrawal(&solana_rpc, pending_pda, args.doge_bridge_program).await?;
+    if pending_finalized.status != PENDING_WITHDRAWAL_STATUS_FINALIZED
+        || pending_finalized.final_txid != final_txid
+    {
+        bail!("pending withdrawal did not record the finalized Dogecoin txid");
+    }
+
+    if let Some(change) = change_utxo.as_ref() {
+        store
+            .finalize_custody_spend(&reservation_id, change, &final_txid)
+            .map_err(|error| anyhow!("finalize custody spend failed: {error}"))?;
+    } else {
+        store.mark_reservation_spent(&reservation_id)?;
+    }
+    store.set_process_withdrawal_status(
+        &authorize_signature.to_string(),
+        OperatorStatus::Confirmed,
+    )?;
+    store.map_process_range_to_txid(&authorize_signature.to_string(), &final_txid)?;
     store.set_withdrawal_request_status(selected.index, OperatorStatus::Confirmed)?;
 
     let evidence = Evidence {
-        schema: "doge-local-process-withdrawal-v2", completed: true, mode: "tracked-custody",
-        limitations: json!({
-            "bridge_owned_utxo_selection": true,
-            "spent_root_witness_available": true,
-            "spent_root_source": "local-tracked-utxo-merkle-tree",
-            "spent_root_new_hex": hex::encode(new_spent_root),
-            "semantic_prover_limit": "SP1 proves the current hash/public-value transition; it does not parse or semantically validate Dogecoin inputs, outputs, custody, inclusion, or spent-UTXO membership",
-            "guardian_release": false,
+        schema: "doge-local-process-withdrawal-v3-output-only".into(),
+        stage: "CONFIRMED_FINALIZED".into(),
+        completed: true,
+        request: json!({
+            "index": selected.index,
+            "burnSignature": selected.record.signature.to_string(),
+            "slot": selected.record.slot,
+            "user": selected.record.user_pubkey.to_string(),
+            "grossAmountSats": selected.record.amount_sats,
+            "feeAmountSats": fee.fees_generated,
+            "recipientAmountSats": fee.amount_after_fees,
+            "addressType": selected.record.address_type,
+            "recipientPayloadHex": hex::encode(selected.record.recipient_address),
+            "recipientRegtestAddress": recipient_address,
+            "snapshotSignature": snapshot_signature.to_string(),
         }),
-        request: json!({ "index": selected.index, "burn_signature": selected.record.signature.to_string(), "slot": selected.record.slot, "user": selected.record.user_pubkey.to_string(), "gross_amount_sats": selected.record.amount_sats, "fee_amount_sats": fee.fees_generated, "net_amount_sats": fee.amount_after_fees, "address_type": selected.record.address_type, "recipient_payload_hex": hex::encode(selected.record.recipient_address), "recipient_regtest_address": recipient_address, "authoritative_source": "Solana history; no overrides" }),
-        snapshot: json!({ "signature": snapshot_signature.to_string(), "hash_hex": hex::encode(state.withdrawal_snapshot.get_hash()), "requested_root_hex": hex::encode(state.withdrawal_snapshot.requested_withdrawals_tree_root), "request_end_index": state.withdrawal_snapshot.next_requested_withdrawals_tree_index }),
-        dogecoin: json!({ "txid": txid_text, "raw_single_sha256_hex": hex::encode(raw_hash), "raw_bytes": raw_bytes.len(), "recipient_vout": withdrawal_vout, "recipient_sats": paid_sats, "change_sats": plan.change_sats, "fee_sats": args.fee_sats, "confirmations": confirmations }),
-        proof: json!({ "system": "SP1 v6 Groth16", "mock_zkp": false, "proof_path": proof_path, "proof_bytes": GROTH16_PROOF_SIZE, "proof_sha256_hex": hex::encode(Sha256::digest(proof)), "public_values_path": pubvals_path, "public_values_hex": hex::encode(public_values), "withdrawal_vk": EXPECTED_WITHDRAWAL_VK }),
-        solana_process: json!({ "signature": process_signature.to_string(), "slot": process_meta.slot, "compute_unit_limit": PROCESS_COMPUTE_UNITS, "generic_buffer": buffer.to_string(), "new_processed_index": new_index, "old_spent_root_hex": hex::encode(old_spent_root), "new_spent_root_hex": hex::encode(new_spent_root) }),
-        noop_shim: json!({ "verified": true, "signature": noop.signature.to_string(), "emitter": noop.emitter.to_string(), "payer": noop.payer.to_string(), "sighash_hex": hex::encode(noop.sighash), "doge_tx_bytes": noop.doge_tx_bytes.len() }),
-        operator_store: json!({ "enabled": true, "path": args.operator_store, "linkage": "burn <-> Dogecoin txid <-> process <-> custody persisted" }),
-        custody: json!({ "reservation_id": reservation_id, "selected_utxos": reserved_utxos.iter().map(|u| json!({"txid": hex::encode(u.txid), "vout": u.vout, "sats": u.amount_sats, "leaf_index": u.leaf_index.to_string()})).collect::<Vec<_>>(), "selected_total_sats": selected_sats, "change_sats": plan.change_sats, "change_registered": change_utxo.is_some(), "spent_leaf_indices": spent_combined_indices.iter().map(|ci| ci.to_string()).collect::<Vec<_>>() }),
+        authorize: json!({
+            "signature": authorize_signature.to_string(),
+            "slot": authorize_meta.slot,
+            "pendingPda": pending_pda.to_string(),
+            "intentHashHex": hex::encode(intent_hash),
+            "utx0HashHex": hex::encode(prepared.utx0_hash),
+            "unsignedTxHashHex": hex::encode(prepared.unsigned_tx_hash),
+            "utx0Buffer": utx0_buffer.to_string(),
+            "requestStart": request_start,
+            "requestEnd": request_end,
+            "managerSetIndex": args.manager_set_index,
+            "inputCount": prepared.utx0.inputs.len(),
+            "noopVerified": true,
+            "noopProgram": noop.emitter.to_string(),
+            "sequence": sequence,
+            "activeIntentHashHex": hex::encode(post_authorize_state.active_withdrawal_intent_hash),
+        }),
+        relay: json!({
+            "managerServiceUrl": args.manager_service_url,
+            "electrsUrl": args.electrs_url,
+            "vaaHashHex": hex::encode(relayed.evidence.vaa_hash),
+            "vaaSequence": sequence,
+            "signedVaaBytes": relayed.evidence.signed_vaa_bytes,
+            "signedVaaSha256Hex": hex::encode(relayed.evidence.signed_vaa_sha256),
+            "managerSetIndex": args.manager_set_index,
+            "signatureCount": relayed.evidence.signature_count,
+            "quorum": relayed.evidence.required,
+            "managerTotal": relayed.evidence.total,
+            "signerIndices": relayed.evidence.signer_indices,
+            "txid": relayed.txid_text,
+            "finalTxidInternalHex": hex::encode(relayed.final_txid),
+            "signedRawBytes": relayed.raw_bytes.len(),
+            "signedRawSha256Hex": hex::encode(relayed.raw_hash),
+            "broadcast": true,
+        }),
+        confirmation: json!({
+            "status": "CONFIRMED",
+            "finalTxidInternalHex": hex::encode(final_txid),
+            "blockHashInternalHex": hex::encode(block_hash),
+            "blockHeight": block_height,
+            "txIndexInBlock": tx_index_in_block,
+            "confirmations": confirmations,
+            "recipientVout": withdrawal_vout,
+            "changeSats": plan.change_sats,
+            "transactionMerkleBranchHex": tx_merkle_branch.iter().map(hex::encode).collect::<Vec<_>>(),
+        }),
+        finalize: json!({
+            "status": "FINALIZED",
+            "instruction": "finalize_confirmed_withdrawal",
+            "discriminator": 17,
+            "permissionless": true,
+            "finalizeConfirmed": true,
+            "signature": finalize_signature.to_string(),
+            "slot": finalize_meta.slot,
+            "processedIndex": finalized_state.next_processed_withdrawals_index,
+            "activeIntentCleared": finalized_state.active_withdrawal_intent_hash == [0u8; 32],
+            "signedTxBuffer": signed_tx_buffer.to_string(),
+        }),
+        custody: json!({
+            "operatorStore": args.operator_store,
+            "reservationId": reservation_id,
+            "selectedTotalSats": selected_sats,
+            "minerFeeSats": args.fee_sats,
+            "changeRegistered": change_utxo.is_some(),
+            "selectedUtxos": reserved_utxos.iter().map(|utxo| json!({
+                "txidInternalHex": hex::encode(utxo.txid),
+                "vout": utxo.vout,
+                "amountSats": utxo.amount_sats,
+                "leafIndex": utxo.leaf_index,
+                "originalRecipientHex": hex::encode(utxo.original_recipient_address),
+            })).collect::<Vec<_>>(),
+        }),
     };
-    if let Some(parent) = args.evidence_path.parent() { std::fs::create_dir_all(parent)?; }
-    std::fs::write(&args.evidence_path, serde_json::to_vec_pretty(&evidence)?)
-        .with_context(|| format!("write {}", args.evidence_path.display()))?;
-    println!("{}", serde_json::to_string_pretty(&evidence)?);
+    write_evidence(&args.evidence_path, &evidence)
+}
+
+fn write_evidence(path: &Path, evidence: &Evidence) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(evidence)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    println!("{}", serde_json::to_string_pretty(evidence)?);
     Ok(())
+}
+
+fn build_prepared_transaction(
+    selected: &IndexedRequest,
+    reserved_utxos: &[CustodyUtxo],
+    plan: &doge_local_ops::CustodyTransactionPlan,
+    bridge_state_pda: Pubkey,
+    manager_set_index: u32,
+    manager_set: &ManagerSet,
+    recipient_address: &str,
+) -> Result<PreparedTransaction> {
+    let emitter = bridge_state_pda.to_bytes();
+    let mut inputs = Vec::with_capacity(reserved_utxos.len());
+    let mut redeem_scripts = Vec::with_capacity(reserved_utxos.len());
+
+    for utxo in reserved_utxos {
+        let redeem_script = build_redeem_script(
+            SOLANA_EMITTER_CHAIN,
+            &emitter,
+            &utxo.original_recipient_address,
+            manager_set.m,
+            &manager_set.pubkeys,
+        )?;
+        let script_hash = hash160(&redeem_script);
+        let derived_address = dogecoin_regtest_address(1, script_hash)?;
+        if derived_address != utxo.custody_address {
+            bail!(
+                "custody UTXO {}:{} address {} does not match derived P2SH address {}",
+                hex::encode(utxo.txid),
+                utxo.vout,
+                utxo.custody_address,
+                derived_address
+            );
+        }
+        let expected_script_pubkey = hex::encode(p2sh_script_pubkey(&script_hash));
+        if !utxo.script_pubkey_hex.is_empty()
+            && !utxo
+                .script_pubkey_hex
+                .eq_ignore_ascii_case(&expected_script_pubkey)
+        {
+            bail!(
+                "custody UTXO {}:{} scriptPubKey does not match its derived redeem script",
+                hex::encode(utxo.txid),
+                utxo.vout
+            );
+        }
+
+        let mut transaction_id = utxo.txid;
+        transaction_id.reverse();
+        inputs.push(Utx0Input {
+            original_recipient_address: utxo.original_recipient_address,
+            transaction_id,
+            vout: utxo.vout,
+        });
+        redeem_scripts.push(redeem_script);
+    }
+
+    let recipient_type = UtxoAddressType::from_u32(selected.record.address_type)?;
+    let mut outputs = vec![Utx0Output {
+        amount: plan.recipient_sats,
+        address_type: recipient_type,
+        address: selected.record.recipient_address.to_vec(),
+    }];
+
+    let (change_script_hash, change_address) = if plan.change_sats == 0 {
+        (None, None)
+    } else {
+        let change_redeem_script = build_redeem_script(
+            SOLANA_EMITTER_CHAIN,
+            &emitter,
+            &[0u8; 32],
+            manager_set.m,
+            &manager_set.pubkeys,
+        )?;
+        let change_hash = hash160(&change_redeem_script);
+        let change_address = dogecoin_regtest_address(1, change_hash)?;
+        if change_address == recipient_address {
+            bail!("derived change address equals the withdrawal recipient address");
+        }
+        outputs.push(Utx0Output {
+            amount: plan.change_sats,
+            address_type: UtxoAddressType::P2sh,
+            address: change_hash.to_vec(),
+        });
+        (Some(change_hash), Some(change_address))
+    };
+
+    let utx0 = Utx0UnlockPayload {
+        destination_chain: DOGECOIN_CHAIN_ID,
+        delegated_manager_set_index: manager_set_index,
+        inputs,
+        outputs,
+    };
+    let utx0_bytes = utx0.serialize()?;
+    let unsigned_tx = UnsignedTransaction::from_utx0(&utx0, redeem_scripts)?;
+    let unsigned_tx_bytes = unsigned_tx.serialize();
+    let utx0_hash = hash_impl_sha256_bytes(&utx0_bytes);
+    let unsigned_tx_hash = hash_impl_sha256_bytes(&unsigned_tx_bytes);
+
+    Ok(PreparedTransaction {
+        utx0,
+        utx0_bytes,
+        unsigned_tx_bytes,
+        utx0_hash,
+        unsigned_tx_hash,
+        change_script_hash,
+        change_address,
+    })
+}
+
+async fn register_local_withdrawal(
+    client: &HttpClient,
+    manager_service_url: &str,
+    emitter: Pubkey,
+    sequence: u64,
+    payload: &[u8],
+) -> Result<()> {
+    let url = format!(
+        "{}/api/v1/withdrawals",
+        manager_service_url.trim_end_matches('/')
+    );
+    let response = client
+        .post(&url)
+        .json(&RegisterWithdrawalRequest {
+            emitter_chain: SOLANA_EMITTER_CHAIN,
+            emitter_address_hex: hex::encode(emitter.to_bytes()),
+            sequence,
+            payload_hex: hex::encode(payload),
+        })
+        .send()
+        .await
+        .with_context(|| format!("register withdrawal with {url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("read manager registration response")?;
+    if !status.is_success() {
+        bail!("manager registration returned {status}: {body}");
+    }
+    let registered: RegisterWithdrawalResponse =
+        serde_json::from_str(&body).context("decode manager registration response")?;
+    if registered.sequence != sequence {
+        bail!(
+            "manager registration returned sequence {}, expected {sequence}",
+            registered.sequence
+        );
+    }
+    Ok(())
+}
+
+async fn relay_and_broadcast(
+    client: &HttpClient,
+    manager_service_url: &str,
+    electrs_url: &str,
+    emitter: Pubkey,
+    sequence: u64,
+    manager_set_index: u32,
+    manager_set: &ManagerSet,
+    prepared: &PreparedTransaction,
+    poll_interval: Duration,
+    timeout: Duration,
+    manager_signing_enabled: bool,
+    broadcast_enabled: bool,
+) -> Result<RelayedTransaction> {
+    let emitter_bytes = emitter.to_bytes();
+    // Dry-run (manager_signing_enabled=false): fetch whatever signatures the
+    // Manager service already has once, without polling for new ones. Full
+    // mode: poll until the service reports the signature set is complete.
+    let signatures = if manager_signing_enabled {
+        wait_for_manager_signatures(
+            client,
+            manager_service_url,
+            &emitter_bytes,
+            sequence,
+            poll_interval,
+            timeout,
+        )
+        .await?
+    } else {
+        println!("[dry-run] manager signing skipped (manager_signing_enabled=false); fetching pre-existing signatures once");
+        fetch_manager_signatures(
+            client,
+            manager_service_url,
+            SOLANA_EMITTER_CHAIN,
+            &emitter_bytes,
+            sequence,
+        )
+        .await?
+    };
+    if signatures.destination_chain != DOGECOIN_CHAIN_ID
+        || signatures.manager_set_index != manager_set_index
+        || signatures.required != manager_set.m as u32
+        || signatures.total != manager_set.n as u32
+    {
+        bail!("manager response metadata does not match the prepared UTX0/manager set");
+    }
+
+    let signed_vaa = fetch_signed_vaa(
+        client,
+        manager_service_url,
+        SOLANA_EMITTER_CHAIN,
+        &emitter_bytes,
+        sequence,
+    )
+    .await?;
+    if !vaa_hash_matches(&signed_vaa, &signatures.vaa_hash)? {
+        bail!(
+            "manager vaaHash {} does not match signed VAA digest {}",
+            hex::encode(signatures.vaa_hash),
+            hex::encode(vaa_signing_digest(&signed_vaa)?)
+        );
+    }
+    let vaa = parse_vaa(&signed_vaa)?;
+    if vaa.emitter_chain != SOLANA_EMITTER_CHAIN
+        || vaa.emitter_address != emitter_bytes
+        || vaa.sequence != sequence
+        || vaa.payload != prepared.utx0_bytes
+    {
+        bail!("signed VAA does not match the emitted withdrawal identity/payload");
+    }
+    let decoded_payload = Utx0UnlockPayload::parse(&vaa.payload)?;
+    if decoded_payload != prepared.utx0 {
+        bail!("signed VAA UTX0 differs from the prepared payload");
+    }
+
+    let relay_evidence = RelayEvidence {
+        vaa_hash: signatures.vaa_hash,
+        signed_vaa_sha256: hash_impl_sha256_bytes(&signed_vaa),
+        signed_vaa_bytes: signed_vaa.len(),
+        signature_count: signatures.signatures.len(),
+        required: signatures.required,
+        total: signatures.total,
+        signer_indices: signatures
+            .signatures
+            .iter()
+            .map(|signer| signer.signer_index)
+            .collect(),
+    };
+    let redeem_scripts = prepared
+        .utx0
+        .inputs
+        .iter()
+        .map(|input| {
+            build_redeem_script(
+                SOLANA_EMITTER_CHAIN,
+                &emitter_bytes,
+                &input.original_recipient_address,
+                manager_set.m,
+                &manager_set.pubkeys,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut transaction = UnsignedTransaction::from_utx0(&prepared.utx0, redeem_scripts)?;
+    if transaction.serialize() != prepared.unsigned_tx_bytes {
+        bail!("relay reconstructed different unsigned Dogecoin transaction bytes");
+    }
+    let sighashes = (0..transaction.input_count())
+        .map(|input_index| transaction.sighash_all(input_index))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut seen_signers = HashSet::new();
+    let mut per_input = vec![Vec::<(u8, Vec<u8>)>::new(); transaction.input_count()];
+    for signer in &signatures.signatures {
+        if !seen_signers.insert(signer.signer_index) {
+            bail!(
+                "manager response contains duplicate signer {}",
+                signer.signer_index
+            );
+        }
+        let signer_index = signer.signer_index as usize;
+        let public_key = manager_set
+            .pubkeys
+            .get(signer_index)
+            .ok_or_else(|| anyhow!("manager signer index {signer_index} is out of range"))?;
+        if signer.input_signatures.len() != transaction.input_count() {
+            bail!(
+                "manager signer {signer_index} returned {} input signatures, expected {}",
+                signer.input_signatures.len(),
+                transaction.input_count()
+            );
+        }
+        for (input_index, signature) in signer.input_signatures.iter().enumerate() {
+            if signature.last().copied() != Some(1) {
+                bail!("manager signer {signer_index} input {input_index} did not use SIGHASH_ALL");
+            }
+            if !verify_manager_signature(public_key, &sighashes[input_index], signature)? {
+                bail!("manager signer {signer_index} input {input_index} signature is invalid");
+            }
+            per_input[input_index].push((signer.signer_index, signature.clone()));
+        }
+    }
+
+    let dry_run = !manager_signing_enabled;
+    let mut have_quorum = true;
+    for (input_index, candidates) in per_input.iter_mut().enumerate() {
+        candidates.sort_by_key(|(signer_index, _)| *signer_index);
+        if candidates.len() < manager_set.m as usize {
+            have_quorum = false;
+            if dry_run {
+                println!(
+                    "[dry-run] input {input_index} has {}/{} valid manager signatures; scriptSig assembly skipped",
+                    candidates.len(),
+                    manager_set.m
+                );
+                continue;
+            }
+            bail!(
+                "input {input_index} has {} valid manager signatures, need {}",
+                candidates.len(),
+                manager_set.m
+            );
+        }
+        let selected_signatures = candidates
+            .iter()
+            .take(manager_set.m as usize)
+            .map(|(_, signature)| signature.clone())
+            .collect::<Vec<_>>();
+        transaction.apply_script_sig(input_index, &selected_signatures)?;
+    }
+
+    let raw_bytes = transaction.serialize();
+    let final_txid = double_sha256(&raw_bytes);
+    let expected_display_txid = hex::encode(transaction.txid());
+    let txid_text = if broadcast_enabled {
+        let txid_text = broadcast_electrs(client, electrs_url, &hex::encode(&raw_bytes)).await?;
+        if !txid_text.eq_ignore_ascii_case(&expected_display_txid) {
+            bail!(
+                "electrs returned txid {txid_text}, locally assembled transaction is {expected_display_txid}"
+            );
+        }
+        let displayed_internal = decode_displayed_hash32("electrs txid", &txid_text)?;
+        if displayed_internal != final_txid {
+            bail!("electrs txid byte order does not match the signed transaction");
+        }
+        txid_text
+    } else {
+        println!("[dry-run] broadcast skipped (broadcast_enabled=false)");
+        if have_quorum {
+            println!("[dry-run] signed tx hex: {}", hex::encode(&raw_bytes));
+        } else {
+            println!(
+                "[dry-run] unsigned tx hex (quorum not reached): {}",
+                hex::encode(&raw_bytes)
+            );
+        }
+        expected_display_txid
+    };
+
+    Ok(RelayedTransaction {
+        raw_hash: hash_impl_sha256_bytes(&raw_bytes),
+        raw_bytes,
+        final_txid,
+        txid_text,
+        evidence: relay_evidence,
+    })
+}
+
+async fn wait_for_manager_signatures(
+    client: &HttpClient,
+    manager_service_url: &str,
+    emitter: &[u8; 32],
+    sequence: u64,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> Result<ManagerSignatures> {
+    let started = Instant::now();
+    let mut last_error = None;
+    loop {
+        match fetch_manager_signatures(
+            client,
+            manager_service_url,
+            SOLANA_EMITTER_CHAIN,
+            emitter,
+            sequence,
+        )
+        .await
+        {
+            Ok(response) if response.is_complete => return Ok(response),
+            Ok(response) => {
+                last_error = Some(format!(
+                    "manager response incomplete with {} signers",
+                    response.signatures.len()
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out waiting for manager signatures: {}",
+                last_error.unwrap_or_else(|| "no response".into())
+            );
+        }
+        sleep(poll_interval).await;
+    }
+}
+
+async fn broadcast_electrs(
+    client: &HttpClient,
+    electrs_url: &str,
+    raw_hex: &str,
+) -> Result<String> {
+    let url = format!("{}/tx", electrs_url.trim_end_matches('/'));
+    let response = client
+        .post(&url)
+        .header("Content-Type", "text/plain")
+        .body(raw_hex.to_owned())
+        .send()
+        .await
+        .with_context(|| format!("broadcast Dogecoin transaction through {url}"))?;
+    let status = response.status();
+    let body = response.text().await.context("read electrs response")?;
+    if !status.is_success() {
+        bail!("electrs broadcast returned {status}: {body}");
+    }
+    Ok(body.trim().trim_matches('"').to_owned())
+}
+
+/// Verify the pending PDA after authorize_withdrawal: status must be
+/// PENDING_VAA and the authorization bindings must match.
+fn verify_pending_authorized(
+    pending: &PendingWithdrawal,
+    intent_hash: [u8; 32],
+    request_start: u64,
+    request_end: u64,
+    manager_set_index: u32,
+    utx0_hash: [u8; 32],
+    unsigned_tx_hash: [u8; 32],
+) -> Result<()> {
+    if pending.status != PENDING_WITHDRAWAL_STATUS_PENDING_VAA
+        || pending.intent_hash != intent_hash
+        || pending.request_start != request_start
+        || pending.request_end != request_end
+        || pending.manager_set_index != manager_set_index
+        || pending.utx0_hash != utx0_hash
+        || pending.unsigned_tx_hash != unsigned_tx_hash
+    {
+        bail!("authorized PendingWithdrawal PDA does not match the submitted intent");
+    }
+    Ok(())
+}
+
+/// Authorization must not advance the withdrawal cursor or mutate finalized
+/// bridge state. Only `active_withdrawal_intent_hash` should change.
+fn verify_authorize_state_unchanged(
+    before: &doge_bridge_client::PsyBridgeProgramState,
+    after: &doge_bridge_client::PsyBridgeProgramState,
+    expected_intent_hash: [u8; 32],
+) -> Result<()> {
+    if after.last_return_output != before.last_return_output
+        || after.spent_txo_tree_root != before.spent_txo_tree_root
+        || after.next_processed_withdrawals_index != before.next_processed_withdrawals_index
+        || after.total_spent_deposit_utxo_count != before.total_spent_deposit_utxo_count
+    {
+        bail!("authorize_withdrawal mutated finalized bridge state before Dogecoin confirmation");
+    }
+    if after.active_withdrawal_intent_hash != expected_intent_hash {
+        bail!(
+            "authorize_withdrawal did not set active_withdrawal_intent_hash to the expected intent"
+        );
+    }
+    Ok(())
+}
+
+/// Finalization must advance the withdrawal cursor to request_end, clear the
+/// active intent, and append the final_txid to the sent-transactions tree.
+fn verify_finalized_state_advanced(
+    finalized: &doge_bridge_client::PsyBridgeProgramState,
+    pre_authorize: &doge_bridge_client::PsyBridgeProgramState,
+    request_end: u64,
+    _final_txid: [u8; 32],
+) -> Result<()> {
+    if finalized.next_processed_withdrawals_index != request_end {
+        bail!(
+            "finalize did not advance cursor: expected {}, got {}",
+            request_end,
+            finalized.next_processed_withdrawals_index
+        );
+    }
+    if finalized.active_withdrawal_intent_hash != [0u8; 32] {
+        bail!("finalize did not clear active_withdrawal_intent_hash");
+    }
+    // The sent-transactions tree should have grown by exactly one leaf.
+    let expected_sent_count = pre_authorize.sent_transactions_tree.next_index + 1;
+    if finalized.sent_transactions_tree.next_index != expected_sent_count {
+        bail!(
+            "finalize did not append exactly one leaf to sent_transactions_tree: expected next_index {}, got {}",
+            expected_sent_count,
+            finalized.sent_transactions_tree.next_index
+        );
+    }
+    // The appended leaf is verified on-chain via the Merkle branch; locally we
+    // only confirm the tree grew by exactly one leaf.
+    Ok(())
+}
+
+fn pending_withdrawal_pda(program_id: Pubkey, intent_hash: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"pending_withdrawal", intent_hash], &program_id).0
+}
+
+async fn read_pending_withdrawal(
+    rpc: &RpcClient,
+    address: Pubkey,
+    expected_owner: Pubkey,
+) -> Result<PendingWithdrawal> {
+    let account = rpc
+        .get_account(&address)
+        .await
+        .with_context(|| format!("read PendingWithdrawal account {address}"))?;
+    if account.owner != expected_owner {
+        bail!(
+            "PendingWithdrawal {address} owner {} != {expected_owner}",
+            account.owner
+        );
+    }
+    if account.data.len() < PendingWithdrawal::SIZE {
+        bail!(
+            "PendingWithdrawal {address} has {} bytes, expected at least {}",
+            account.data.len(),
+            PendingWithdrawal::SIZE
+        );
+    }
+    Ok(bytemuck::pod_read_unaligned(
+        &account.data[..PendingWithdrawal::SIZE],
+    ))
+}
+
+async fn verify_generic_buffer(
+    rpc: &RpcClient,
+    address: Pubkey,
+    expected_owner: Pubkey,
+    expected_writer: Pubkey,
+    payload: &[u8],
+) -> Result<()> {
+    let account = rpc
+        .get_account(&address)
+        .await
+        .with_context(|| format!("read generic buffer {address}"))?;
+    if account.owner != expected_owner {
+        bail!("generic buffer owner mismatch");
+    }
+    if account.data.len() != GENERIC_BUFFER_HEADER_SIZE + payload.len()
+        || account.data[..GENERIC_BUFFER_HEADER_SIZE] != expected_writer.to_bytes()
+        || account.data[GENERIC_BUFFER_HEADER_SIZE..] != *payload
+    {
+        bail!("generic buffer is not the exact 32-byte header plus payload");
+    }
+    Ok(())
+}
+
+/// Extract (block_hash, block_height, tx_index, txids) from a confirmed
+/// Dogecoin transaction. The txids are the displayed (big-endian) hex strings
+/// from `getblock`, suitable for `decode_displayed_hash32`.
+async fn confirmed_position(
+    rpc: &DogeRpc,
+    verbose_transaction: &Value,
+    txid: &str,
+) -> Result<([u8; 32], u32, u16, Vec<String>)> {
+    let block_hash_text = verbose_transaction
+        .get("blockhash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("confirmed transaction missing blockhash"))?;
+    let block_hash = decode_displayed_hash32("Dogecoin block hash", block_hash_text)?;
+    let header = rpc
+        .call("getblockheader", json!([block_hash_text, true]))
+        .await?;
+    let height_u64 = header
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("getblockheader missing height"))?;
+    let height = u32::try_from(height_u64)
+        .map_err(|_| anyhow!("Dogecoin block height {height_u64} exceeds u32"))?;
+    let block = rpc.call("getblock", json!([block_hash_text, 1])).await?;
+    let txids = block
+        .get("tx")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("getblock missing tx array"))?;
+    let index = txids
+        .iter()
+        .position(|value| value.as_str() == Some(txid))
+        .ok_or_else(|| anyhow!("confirmed txid not present in its reported block"))?;
+    let index = u16::try_from(index)
+        .map_err(|_| anyhow!("transaction index {index} exceeds combined-index width"))?;
+    let txid_strings = txids
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    Ok((block_hash, height, index, txid_strings))
+}
+
+/// Compute the Dogecoin transaction Merkle branch (internal-order sibling
+/// hashes) for the transaction at `tx_index` within the block's txid list.
+/// The txids are displayed (big-endian) hex strings; they are reversed to
+/// internal byte order before tree construction. Uses double-SHA256 pairing
+/// with the standard odd-leaf duplication rule.
+fn compute_tx_merkle_branch(txids_displayed: &[String], tx_index: u16) -> Result<Vec<[u8; 32]>> {
+    let mut level: Vec<[u8; 32]> = txids_displayed
+        .iter()
+        .map(|hex| decode_displayed_hash32("block txid", hex))
+        .collect::<Result<Vec<_>>>()?;
+    if level.is_empty() {
+        bail!("block has no transactions");
+    }
+    let mut branch = Vec::new();
+    let mut index = tx_index as usize;
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = *level.last().unwrap();
+            level.push(last);
+        }
+        let sibling_index = index ^ 1;
+        let sibling = level[sibling_index];
+        branch.push(sibling);
+        let mut parents = Vec::with_capacity(level.len() / 2);
+        for i in (0..level.len()).step_by(2) {
+            let mut pair = [0u8; 64];
+            pair[..32].copy_from_slice(&level[i]);
+            pair[32..].copy_from_slice(&level[i + 1]);
+            parents.push(double_sha256(&pair));
+        }
+        level = parents;
+        index >>= 1;
+    }
+    Ok(branch)
+}
+
+fn hash160(bytes: &[u8]) -> [u8; 20] {
+    let sha = Sha256::digest(bytes);
+    Ripemd160::digest(sha).into()
 }
 
 fn read_keypair(path: &Path, role: &str) -> Result<Keypair> {
-    read_keypair_file(path).map_err(|e| anyhow!("read {role} keypair: {e}"))
+    read_keypair_file(path).map_err(|error| anyhow!("read {role} keypair: {error}"))
 }
-fn clone_keypair(k: &Keypair) -> Result<Keypair> { Keypair::from_bytes(&k.to_bytes()).context("clone keypair") }
+
+fn clone_keypair(keypair: &Keypair) -> Result<Keypair> {
+    Keypair::from_bytes(&keypair.to_bytes()).context("clone keypair")
+}
 
 async fn load_indexed_requests(args: &Args, bridge_state: Pubkey) -> Result<Vec<IndexedRequest>> {
-    let config = HistorySyncConfig::new(args.solana_rpc_url.clone(), args.doge_bridge_program, bridge_state, args.pending_mint_program, args.txo_buffer_program)
-        .include_withdrawals(true).include_manual_deposits(false);
+    let config = HistorySyncConfig::new(
+        args.solana_rpc_url.clone(),
+        args.doge_bridge_program,
+        bridge_state,
+        args.pending_mint_program,
+        args.txo_buffer_program,
+    )
+    .include_withdrawals(true)
+    .include_manual_deposits(false);
     let sync = BridgeHistorySync::new(config)?;
-    let (mut rx, mut handle) = sync.stream_history(None).await?;
+    let (mut receiver, mut handle) = sync.stream_history(None).await?;
     let mut requests = Vec::new();
-    while let Some(record) = rx.recv().await { if let HistoryRecord::WithdrawalRequest(record) = record { requests.push(record); } }
+    while let Some(record) = receiver.recv().await {
+        if let HistoryRecord::WithdrawalRequest(record) = record {
+            requests.push(record);
+        }
+    }
     handle.join().await.context("join history sync")?;
-    requests.sort_by_key(|r| r.slot);
-    Ok(requests.into_iter().enumerate().map(|(i, r)| IndexedRequest { index: i as u64, record: r }).collect())
+    requests.sort_by_key(|request| request.slot);
+    Ok(requests
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| IndexedRequest {
+            index: index as u64,
+            record,
+        })
+        .collect())
 }
 
-fn select_request(requests: &[IndexedRequest], idx: Option<u64>, sig: Option<&Signature>) -> Result<IndexedRequest> {
-    match (idx, sig) {
-        (Some(i), None) => requests.iter().find(|r| r.index == i),
-        (None, Some(s)) => requests.iter().find(|r| r.record.signature == *s),
+fn select_request(
+    requests: &[IndexedRequest],
+    index: Option<u64>,
+    signature: Option<&Signature>,
+) -> Result<IndexedRequest> {
+    match (index, signature) {
+        (Some(index), None) => requests.iter().find(|request| request.index == index),
+        (None, Some(signature)) => requests
+            .iter()
+            .find(|request| request.record.signature == *signature),
         _ => bail!("provide exactly one of --request-index or --request-signature"),
-    }.cloned().ok_or_else(|| anyhow!("request not found in Solana history"))
+    }
+    .cloned()
+    .ok_or_else(|| anyhow!("withdrawal request not found in Solana history"))
 }
 
 fn ensure_next_unprocessed(request: &IndexedRequest, next: u64) -> Result<()> {
-    if request.index != next { bail!("request index {} != next unprocessed {next}", request.index); }
+    if request.index != next {
+        bail!(
+            "withdrawal request index {} is not next unprocessed index {next}",
+            request.index
+        );
+    }
     Ok(())
 }
 
-fn verify_snapshot(state: &doge_bridge_client::PsyBridgeProgramState, request: &IndexedRequest) -> Result<()> {
-    let snap = state.withdrawal_snapshot;
-    if request.index >= snap.next_requested_withdrawals_tree_index { bail!("request not in snapshot"); }
-    if snap.requested_withdrawals_tree_root != state.requested_withdrawals_tree.get_root() { bail!("snapshot root mismatch"); }
-    if snap.next_requested_withdrawals_tree_index != state.requested_withdrawals_tree.next_index { bail!("snapshot index mismatch"); }
+fn verify_snapshot(
+    state: &doge_bridge_client::PsyBridgeProgramState,
+    request: &IndexedRequest,
+) -> Result<()> {
+    let snapshot = state.withdrawal_snapshot;
+    if request.index >= snapshot.next_requested_withdrawals_tree_index {
+        bail!("selected withdrawal request is not in the current snapshot");
+    }
+    if snapshot.requested_withdrawals_tree_root != state.requested_withdrawals_tree.get_root()
+        || snapshot.next_requested_withdrawals_tree_index
+            != state.requested_withdrawals_tree.next_index
+    {
+        bail!("withdrawal snapshot does not match the requested-withdrawal tree");
+    }
     Ok(())
 }
 
-fn dogecoin_regtest_address(at: u32, payload: [u8; 20]) -> Result<String> {
-    let version = match at { 0 => 0x6f, 1 => 0xc4, other => bail!("unsupported address type {other}") };
-    let mut bytes = Vec::with_capacity(21); bytes.push(version); bytes.extend_from_slice(&payload);
+fn dogecoin_regtest_address(address_type: u32, payload: [u8; 20]) -> Result<String> {
+    let version = match address_type {
+        0 => 0x6f,
+        1 => 0xc4,
+        other => bail!("unsupported Dogecoin address type {other}"),
+    };
+    let mut bytes = Vec::with_capacity(21);
+    bytes.push(version);
+    bytes.extend_from_slice(&payload);
     Ok(bs58::encode(bytes).with_check().into_string())
 }
 
-fn sats_to_doge_number(sats: u64) -> Result<Number> {
-    let whole = sats / SATS_PER_DOGE;
-    let fraction = sats % SATS_PER_DOGE;
-    let text = if fraction == 0 { whole.to_string() } else {
-        let mut v = format!("{whole}.{fraction:08}");
-        while v.ends_with('0') { v.pop(); }
-        v
-    };
-    Number::from_str(&text).with_context(|| format!("encode {sats} sats"))
-}
-
-fn sats_to_doge_json(sats: u64) -> Result<Value> {
-    serde_json::from_str(&format!("{}.{:08}", sats / SATS_PER_DOGE, sats % SATS_PER_DOGE))
-        .with_context(|| format!("encode {sats} sats as JSON"))
-}
-
 async fn verify_regtest(rpc: &DogeRpc) -> Result<()> {
-    let chain = rpc.call("getblockchaininfo", json!([])).await?
-        .get("chain").and_then(Value::as_str).map(str::to_owned)
+    let chain = rpc
+        .call("getblockchaininfo", json!([]))
+        .await?
+        .get("chain")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
         .ok_or_else(|| anyhow!("getblockchaininfo missing chain"))?;
-    if chain != "regtest" { bail!("refusing chain {chain}"); }
+    if chain != "regtest" {
+        bail!("refusing to run local-manager withdrawal on Dogecoin chain {chain}");
+    }
     Ok(())
 }
 
-async fn wait_for_doge_confirmation(rpc: &DogeRpc, txid: &str, minimum: u32, timeout: Duration, interval: Duration) -> Result<Value> {
-    let start = Instant::now();
+async fn wait_for_doge_confirmation(
+    rpc: &DogeRpc,
+    txid: &str,
+    minimum: u32,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<Value> {
+    let started = Instant::now();
+    let mut last_status = "transaction not yet visible".to_owned();
     loop {
-        let v = rpc.call("getrawtransaction", json!([txid, true])).await?;
-        let c = v.get("confirmations").and_then(Value::as_u64).unwrap_or(0);
-        if c >= minimum as u64 { return Ok(v); }
-        if start.elapsed() >= timeout { bail!("tx {txid} has {c} confirmations after {}s", timeout.as_secs()); }
+        match rpc.call("getrawtransaction", json!([txid, true])).await {
+            Ok(transaction) => {
+                let confirmations = transaction
+                    .get("confirmations")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if confirmations >= minimum as u64 {
+                    return Ok(transaction);
+                }
+                last_status = format!("{confirmations} confirmations");
+            }
+            Err(error) => last_status = error.to_string(),
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "tx {txid} was not confirmed after {}s: {last_status}",
+                timeout.as_secs()
+            );
+        }
         sleep(interval).await;
     }
 }
 
-async fn run_withdrawal_prover(args: &Args, state: &doge_bridge_client::PsyBridgeProgramState, new_return: &PsyReturnTxOutput, new_spent_root: [u8; 32], new_index: u64) -> Result<String> {
-    std::fs::create_dir_all(&args.proof_output_dir)?;
-    let output = Command::new(&args.gen_withdrawal_proof_bin)
-        .arg("--snapshot-hash").arg(hex::encode(state.withdrawal_snapshot.get_hash()))
-        .arg("--old-return-output-bytes").arg(hex::encode(bytemuck::bytes_of(&state.last_return_output)))
-        .arg("--new-return-output-bytes").arg(hex::encode(bytemuck::bytes_of(new_return)))
-        .arg("--old-spent-root").arg(hex::encode(state.spent_txo_tree_root))
-        .arg("--new-spent-root").arg(hex::encode(new_spent_root))
-        .arg("--custodian-hash").arg(hex::encode(state.custodian_wallet_config_hash))
-        .arg("--new-index-u64").arg(new_index.to_string())
-        .arg("--output-dir").arg(&args.proof_output_dir)
-        .output().await.with_context(|| format!("run prover {}", args.gen_withdrawal_proof_bin.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    if !output.status.success() { bail!("prover failed: {}\n{stdout}\n{stderr}", output.status); }
-    Ok(format!("{stdout}\n{stderr}"))
+/// Build authenticated burn-request membership witnesses for authorize_withdrawal.
+///
+/// For each request in `[start, end)`, this carries the leaf preimage and 32-level
+/// FixedMerkleAppendTree sibling path checked directly by the bridge instruction.
+/// This is not a zero-knowledge proof.
+fn build_burn_request_proofs(
+    history: &[IndexedRequest],
+    state: &doge_bridge_client::PsyBridgeProgramState,
+    request_start: u64,
+    request_end: u64,
+) -> Result<Vec<WithdrawalRequestProof>> {
+    let snapshot_request_count = usize::try_from(
+        state
+            .withdrawal_snapshot
+            .next_requested_withdrawals_tree_index,
+    )
+    .map_err(|_| anyhow!("snapshot request count exceeds usize"))?;
+    let snapshot_history = history
+        .get(..snapshot_request_count)
+        .ok_or_else(|| anyhow!("withdrawal history does not cover the snapshot tree"))?;
+
+    // Rebuild the tree to verify our history matches the snapshot root.
+    let mut request_tree = FixedMerkleAppendTree::new_empty();
+    for request in snapshot_history {
+        let leaf = PsyWithdrawalRequest::new(
+            request.record.recipient_address,
+            request.record.net_amount_sats,
+            request.record.address_type,
+        )
+        .to_leaf();
+        request_tree.append(leaf);
+    }
+    if request_tree.get_root() != state.withdrawal_snapshot.requested_withdrawals_tree_root {
+        bail!("withdrawal request history does not reconstruct the snapshot tree");
+    }
+
+    // Compute membership siblings for each request in the range.
+    let mut proofs = Vec::new();
+    for request_index in request_start..request_end {
+        let request = snapshot_history
+            .iter()
+            .find(|r| r.index == request_index)
+            .ok_or_else(|| anyhow!("request {request_index} not found in snapshot history"))?;
+        let request_leaf = PsyWithdrawalRequest::new(
+            request.record.recipient_address,
+            request.record.net_amount_sats,
+            request.record.address_type,
+        );
+        let siblings = request_membership_siblings(snapshot_history, request_index)?;
+        proofs.push(WithdrawalRequestProof {
+            request: request_leaf,
+            siblings,
+        });
+    }
+    Ok(proofs)
 }
 
-fn validate_withdrawal_artifacts(proof_path: &Path, pubvals_path: &Path, expected: [u8; 32], output: &str) -> Result<([u8; GROTH16_PROOF_SIZE], [u8; 32])> {
-    let (proof, pubvals) = validate_proof_artifacts(proof_path, pubvals_path)?;
-    if proof.len() != GROTH16_PROOF_SIZE { bail!("proof must be exactly {GROTH16_PROOF_SIZE} bytes"); }
-    if proof.iter().all(|b| *b == 0) { bail!("proof is all zeros"); }
-    if pubvals != expected { bail!("public values mismatch"); }
-    if !output.to_ascii_lowercase().contains(&EXPECTED_WITHDRAWAL_VK.to_ascii_lowercase()) { bail!("prover output missing VK"); }
-    Ok((proof, pubvals))
+/// Compute the 32-level Merkle membership siblings for `request_index` in the
+/// `FixedMerkleAppendTree` built from `history`. Uses `SHA256_ZERO_HASHES`
+/// for missing nodes, matching the on-chain tree construction.
+fn request_membership_siblings(
+    history: &[IndexedRequest],
+    request_index: u64,
+) -> Result<[[u8; 32]; 32]> {
+    if request_index >= history.len() as u64 {
+        bail!("request proof index is absent from history");
+    }
+    let mut level = history
+        .iter()
+        .map(|request| {
+            PsyWithdrawalRequest::new(
+                request.record.recipient_address,
+                request.record.net_amount_sats,
+                request.record.address_type,
+            )
+            .to_leaf()
+        })
+        .collect::<Vec<_>>();
+    let mut index = usize::try_from(request_index)?;
+    let mut siblings = [[0u8; 32]; 32];
+    for height in 0..32 {
+        let sibling_index = index ^ 1;
+        siblings[height] = level
+            .get(sibling_index)
+            .copied()
+            .unwrap_or(SHA256_ZERO_HASHES[height]);
+        let parent_len = (level.len() + 1) / 2;
+        let mut parents = Vec::with_capacity(parent_len);
+        for parent in 0..parent_len {
+            let left = level
+                .get(parent * 2)
+                .copied()
+                .unwrap_or(SHA256_ZERO_HASHES[height]);
+            let right = level
+                .get(parent * 2 + 1)
+                .copied()
+                .unwrap_or(SHA256_ZERO_HASHES[height]);
+            let mut pair = [0u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            parents.push(hash_impl_sha256_bytes(&pair));
+        }
+        level = parents;
+        index >>= 1;
+    }
+    Ok(siblings)
 }
 
-fn remove_stale(path: &Path) -> Result<()> { if path.exists() { std::fs::remove_file(path)?; } Ok(()) }
+fn generic_buffer_chunks(data: &[u8]) -> impl Iterator<Item = Result<(u32, &[u8])>> {
+    data.chunks(GENERIC_BUFFER_CHUNK_SIZE)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let offset = index
+                .checked_mul(GENERIC_BUFFER_CHUNK_SIZE)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or_else(|| anyhow!("generic buffer write offset exceeds u32"))?;
+            Ok((offset, chunk))
+        })
+}
 
-async fn create_generic_buffer(rpc: &RpcClient, payer: &Keypair, program_id: Pubkey, data: &[u8]) -> Result<Pubkey> {
+async fn create_generic_buffer(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    program_id: Pubkey,
+    data: &[u8],
+) -> Result<Pubkey> {
+    let target_size =
+        u32::try_from(data.len()).map_err(|_| anyhow!("generic buffer payload exceeds u32"))?;
     let account = Keypair::new();
-    let rent = rpc.get_minimum_balance_for_rent_exemption(GENERIC_BUFFER_HEADER_SIZE).await?;
-    let create = system_instruction::create_account(&payer.pubkey(), &account.pubkey(), rent, GENERIC_BUFFER_HEADER_SIZE as u64, &program_id);
-    let init = instructions::generic_buffer_init(program_id, account.pubkey(), payer.pubkey(), data.len() as u32);
+    let rent = rpc
+        .get_minimum_balance_for_rent_exemption(GENERIC_BUFFER_HEADER_SIZE)
+        .await?;
+    let create = system_instruction::create_account(
+        &payer.pubkey(),
+        &account.pubkey(),
+        rent,
+        GENERIC_BUFFER_HEADER_SIZE as u64,
+        &program_id,
+    );
+    let init = instructions::generic_buffer_init(
+        program_id,
+        account.pubkey(),
+        payer.pubkey(),
+        target_size,
+    );
     send_solana_transaction(rpc, payer, &[create, init], &[&account]).await?;
-    for (i, chunk) in data.chunks(GENERIC_BUFFER_CHUNK_SIZE).enumerate() {
-        let write = instructions::generic_buffer_write(program_id, account.pubkey(), payer.pubkey(), (i * GENERIC_BUFFER_CHUNK_SIZE) as u32, chunk);
+    for chunk in generic_buffer_chunks(data) {
+        let (offset, chunk) = chunk?;
+        let write = instructions::generic_buffer_write(
+            program_id,
+            account.pubkey(),
+            payer.pubkey(),
+            offset,
+            chunk,
+        );
         send_solana_transaction(rpc, payer, &[write], &[]).await?;
     }
     Ok(account.pubkey())
 }
 
-async fn send_solana_transaction(rpc: &RpcClient, payer: &Keypair, instructions: &[solana_sdk::instruction::Instruction], extra: &[&Keypair]) -> Result<Signature> {
-    let blockhash = rpc.get_latest_blockhash().await?;
-    let mut signers = vec![payer]; signers.extend_from_slice(extra);
-    let tx = Transaction::new_signed_with_payer(instructions, Some(&payer.pubkey()), &signers, blockhash);
-    rpc.send_and_confirm_transaction(&tx).await.map_err(Into::into)
+async fn create_generic_buffer_with_writer(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    writer: &Keypair,
+    program_id: Pubkey,
+    data: &[u8],
+) -> Result<Pubkey> {
+    let target_size =
+        u32::try_from(data.len()).map_err(|_| anyhow!("generic buffer payload exceeds u32"))?;
+    let account = Keypair::new();
+    let rent = rpc
+        .get_minimum_balance_for_rent_exemption(GENERIC_BUFFER_HEADER_SIZE)
+        .await?;
+    let create = system_instruction::create_account(
+        &payer.pubkey(),
+        &account.pubkey(),
+        rent,
+        GENERIC_BUFFER_HEADER_SIZE as u64,
+        &program_id,
+    );
+    let init = instructions::generic_buffer_init(
+        program_id,
+        account.pubkey(),
+        writer.pubkey(),
+        target_size,
+    );
+    send_solana_transaction(rpc, payer, &[create, init], &[writer, &account]).await?;
+    for chunk in generic_buffer_chunks(data) {
+        let (offset, chunk) = chunk?;
+        let write = instructions::generic_buffer_write(
+            program_id,
+            account.pubkey(),
+            writer.pubkey(),
+            offset,
+            chunk,
+        );
+        send_solana_transaction(rpc, payer, &[write], &[writer]).await?;
+    }
+    Ok(account.pubkey())
 }
 
-async fn find_noop_message(monitor: &NoopShimMonitor, sig: &Signature) -> Result<doge_bridge_client::NoopShimWithdrawalMessage> {
+fn operator_funding_requirement(
+    operator_balance: u64,
+    zero_data_rent_reserve: u64,
+    pending_withdrawal_rent: u64,
+    fee_prepay: u64,
+) -> Result<(u64, u64)> {
+    let required_balance = zero_data_rent_reserve
+        .checked_add(pending_withdrawal_rent)
+        .and_then(|balance| balance.checked_add(fee_prepay))
+        .ok_or_else(|| anyhow!("operator authorize funding requirement overflow"))?;
+    let top_up = if operator_balance >= required_balance {
+        0
+    } else {
+        required_balance
+            .checked_sub(operator_balance)
+            .ok_or_else(|| anyhow!("operator authorize top-up underflow"))?
+    };
+    Ok((required_balance, top_up))
+}
+
+fn operator_funding_transfer_amount(
+    payer: Pubkey,
+    operator: Pubkey,
+    top_up: u64,
+) -> Result<Option<u64>> {
+    if top_up == 0 {
+        return Ok(None);
+    }
+    if payer == operator {
+        bail!(
+            "operator requires {top_up} additional lamports for authorize_withdrawal, but the configured payer and operator are the same account"
+        );
+    }
+    Ok(Some(top_up))
+}
+
+async fn ensure_operator_authorize_funding(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    operator: &Keypair,
+) -> Result<()> {
+    let zero_data_rent_reserve = rpc
+        .get_minimum_balance_for_rent_exemption(0)
+        .await
+        .context("read zero-data account rent exemption")?;
+    let pending_withdrawal_rent = rpc
+        .get_minimum_balance_for_rent_exemption(PendingWithdrawal::SIZE)
+        .await
+        .context("read PendingWithdrawal rent exemption")?;
+    let operator_balance = rpc
+        .get_balance(&operator.pubkey())
+        .await
+        .with_context(|| format!("read operator balance {}", operator.pubkey()))?;
+    let (required_balance, top_up) = operator_funding_requirement(
+        operator_balance,
+        zero_data_rent_reserve,
+        pending_withdrawal_rent,
+        WORMHOLE_FEE_PREPAY_LAMPORTS,
+    )?;
+    let Some(transfer_amount) =
+        operator_funding_transfer_amount(payer.pubkey(), operator.pubkey(), top_up)?
+    else {
+        return Ok(());
+    };
+
+    let transfer =
+        system_instruction::transfer(&payer.pubkey(), &operator.pubkey(), transfer_amount);
+    let signature = send_solana_transaction(rpc, payer, &[transfer], &[])
+        .await
+        .context("fund operator before authorize_withdrawal")?;
+    println!(
+        "Funded operator {} with {} lamports from payer {} before authorize_withdrawal (previous balance: {}, required balance: {}, transaction: {})",
+        operator.pubkey(),
+        transfer_amount,
+        payer.pubkey(),
+        operator_balance,
+        required_balance,
+        signature,
+    );
+    Ok(())
+}
+
+async fn send_solana_transaction(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    instructions: &[solana_sdk::instruction::Instruction],
+    extra_signers: &[&Keypair],
+) -> Result<Signature> {
+    let blockhash = rpc.get_latest_blockhash().await?;
+    let mut signers = vec![payer];
+    for signer in extra_signers {
+        if signer.pubkey() != payer.pubkey()
+            && !signers
+                .iter()
+                .any(|existing| existing.pubkey() == signer.pubkey())
+        {
+            signers.push(*signer);
+        }
+    }
+    let transaction = Transaction::new_signed_with_payer(
+        instructions,
+        Some(&payer.pubkey()),
+        &signers,
+        blockhash,
+    );
+    rpc.send_and_confirm_transaction(&transaction)
+        .await
+        .map_err(Into::into)
+}
+
+async fn find_noop_message_for_programs(
+    args: &Args,
+    bridge_state: Pubkey,
+    signature: &Signature,
+) -> Result<doge_bridge_client::NoopShimWithdrawalMessage> {
+    let mut program_ids = vec![args.noop_shim_program];
+    if args.wormhole_shim_program != args.noop_shim_program {
+        program_ids.push(args.wormhole_shim_program);
+    }
+    let mut last_error = None;
+    for program_id in program_ids {
+        let monitor = NoopShimMonitor::new(
+            NoopShimMonitorConfig::new(args.solana_rpc_url.clone(), bridge_state)
+                .noop_shim_program_id(program_id)
+                .batch_size(50),
+        )?;
+        match find_noop_message(&monitor, signature).await {
+            Ok(message) => return Ok(message),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    bail!(
+        "authorize signature {signature} not found in noop history: {}",
+        last_error.unwrap_or_else(|| "no configured noop program".into())
+    )
+}
+
+async fn find_noop_message(
+    monitor: &NoopShimMonitor,
+    signature: &Signature,
+) -> Result<doge_bridge_client::NoopShimWithdrawalMessage> {
     let mut before = None;
     for _ in 0..10 {
         let page = monitor.get_withdrawals(before, 50).await?;
-        if let Some(msg) = page.messages.into_iter().find(|m| m.signature == *sig) { return Ok(msg); }
-        if !page.has_more { break; } before = page.next_cursor;
+        if let Some(message) = page
+            .messages
+            .into_iter()
+            .find(|message| message.signature == *signature)
+        {
+            return Ok(message);
+        }
+        if !page.has_more {
+            break;
+        }
+        before = page.next_cursor;
     }
-    bail!("process signature {sig} not found in noop history")
+    bail!("authorize signature {signature} not found in noop history")
 }
 
 fn decode_displayed_hash32(name: &str, text: &str) -> Result<[u8; 32]> {
-    let mut bytes = hex::decode(text).with_context(|| format!("decode {name}"))?;
-    if bytes.len() != 32 { bail!("{name} must be 32 bytes"); }
+    let mut bytes = hex::decode(text.trim()).with_context(|| format!("decode {name}"))?;
+    if bytes.len() != 32 {
+        bail!("{name} must be 32 bytes, got {}", bytes.len());
+    }
     bytes.reverse();
-    Ok(bytes.try_into().expect("32"))
+    Ok(bytes.try_into().expect("validated 32-byte hash"))
 }
 
-fn store_request(request: &IndexedRequest, fee_sats: u64, net_sats: u64, status: OperatorStatus) -> WithdrawalRequest {
-    WithdrawalRequest {
-        request_index: request.index, solana_signature: request.record.signature.to_string(),
-        solana_slot: request.record.slot, block_time: request.record.block_time,
-        user_pubkey: request.record.user_pubkey.to_string(), gross_amount_sats: request.record.amount_sats,
-        fee_amount_sats: fee_sats, net_amount_sats: net_sats, address_type: request.record.address_type,
-        recipient: request.record.recipient_address, status,
+#[cfg(test)]
+mod operator_funding_tests {
+    use super::*;
+
+    #[test]
+    fn computes_exact_required_balance_and_top_up() {
+        let (required_balance, top_up) =
+            operator_funding_requirement(1_500, 900, 2_000, 1_000).unwrap();
+
+        assert_eq!(required_balance, 3_900);
+        assert_eq!(top_up, 2_400);
+    }
+
+    #[test]
+    fn sufficient_operator_balance_requires_no_top_up() {
+        assert_eq!(
+            operator_funding_requirement(3_900, 900, 2_000, 1_000).unwrap(),
+            (3_900, 0)
+        );
+        assert_eq!(
+            operator_funding_requirement(4_000, 900, 2_000, 1_000).unwrap(),
+            (3_900, 0)
+        );
+    }
+
+    #[test]
+    fn funding_requirement_rejects_overflow() {
+        assert!(operator_funding_requirement(0, u64::MAX, 1, 0).is_err());
+        assert!(operator_funding_requirement(0, u64::MAX - 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn same_key_is_noop_without_shortfall_and_errors_with_shortfall() {
+        let key = Pubkey::new_unique();
+        assert_eq!(operator_funding_transfer_amount(key, key, 0).unwrap(), None);
+
+        let error = operator_funding_transfer_amount(key, key, 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("payer and operator are the same account"));
+    }
+
+    #[test]
+    fn different_payer_transfers_exact_shortfall() {
+        assert_eq!(
+            operator_funding_transfer_amount(Pubkey::new_unique(), Pubkey::new_unique(), 2_400)
+                .unwrap(),
+            Some(2_400)
+        );
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod request_proof_tests {
     use super::*;
-    fn record(byte: u8, amount: u64, at: u32) -> WithdrawalRequestRecord {
-        WithdrawalRequestRecord {
-            signature: Signature::new_unique(), slot: byte as u64, block_time: None,
-            amount_sats: amount, recipient_address: [byte; 20], address_type: at,
-            user_pubkey: Keypair::new().pubkey(),
+
+    fn request(index: u64, gross: u64, net: u64, recipient_byte: u8) -> IndexedRequest {
+        IndexedRequest {
+            index,
+            record: WithdrawalRequestRecord {
+                signature: Signature::new_unique(),
+                slot: index + 1,
+                block_time: None,
+                amount_sats: gross,
+                net_amount_sats: net,
+                recipient_address: [recipient_byte; 20],
+                address_type: 0,
+                user_pubkey: Pubkey::new_unique(),
+            },
         }
     }
-    #[test] fn converts_regtest_addresses() {
-        let p2pkh = dogecoin_regtest_address(0, [5u8; 20]).unwrap();
-        let p2sh = dogecoin_regtest_address(1, [5u8; 20]).unwrap();
-        assert!(dogecoin_regtest_address(2, [5u8; 20]).is_err());
-        assert!(bs58::decode(&p2pkh).with_check(None).into_vec().is_ok());
-        assert!(bs58::decode(&p2sh).with_check(None).into_vec().is_ok());
+
+    #[test]
+    fn nonzero_fee_history_reconstructs_exact_net_leaf_root() {
+        let history = vec![
+            request(0, 50_000_000, 48_500_000, 0x11),
+            request(1, 25_000_000, 23_750_000, 0x22),
+        ];
+        let mut expected_tree = FixedMerkleAppendTree::new_empty();
+        for request in &history {
+            expected_tree.append(
+                PsyWithdrawalRequest::new(
+                    request.record.recipient_address,
+                    request.record.net_amount_sats,
+                    request.record.address_type,
+                )
+                .to_leaf(),
+            );
+        }
+        let mut state = doge_bridge_client::PsyBridgeProgramState::default();
+        state
+            .withdrawal_snapshot
+            .next_requested_withdrawals_tree_index = history.len() as u64;
+        state.withdrawal_snapshot.requested_withdrawals_tree_root = expected_tree.get_root();
+
+        let proofs = build_burn_request_proofs(&history, &state, 0, 2).unwrap();
+        assert_eq!(proofs[0].request.amount_sats, 48_500_000);
+        assert_eq!(proofs[1].request.amount_sats, 23_750_000);
+
+        let mut gross_tree = FixedMerkleAppendTree::new_empty();
+        for request in &history {
+            gross_tree.append(
+                PsyWithdrawalRequest::new(
+                    request.record.recipient_address,
+                    request.record.amount_sats,
+                    request.record.address_type,
+                )
+                .to_leaf(),
+            );
+        }
+        assert_ne!(gross_tree.get_root(), expected_tree.get_root());
     }
-    #[test] fn selects_request_by_index_or_signature() {
-        let a = IndexedRequest { index: 0, record: record(1, 100, 0) };
-        let b = IndexedRequest { index: 1, record: record(2, 200, 1) };
-        assert_eq!(select_request(&[a.clone(), b.clone()], Some(1), None).unwrap().record.amount_sats, 200);
-        assert_eq!(select_request(&[a.clone(), b.clone()], None, Some(&a.record.signature)).unwrap().index, 0);
-        assert!(select_request(&[a, b], Some(0), Some(&Signature::new_unique())).is_err());
+}
+
+#[cfg(test)]
+mod generic_buffer_tests {
+    use super::*;
+    use solana_sdk::hash::Hash;
+
+    #[test]
+    fn max_two_signer_write_transaction_fits_with_safety_margin() {
+        let payer = Keypair::new();
+        let writer = Keypair::new();
+        let write = instructions::generic_buffer_write(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            writer.pubkey(),
+            0,
+            &vec![0u8; GENERIC_BUFFER_CHUNK_SIZE],
+        );
+        let transaction = Transaction::new_signed_with_payer(
+            &[write],
+            Some(&payer.pubkey()),
+            &[&payer, &writer],
+            Hash::new_unique(),
+        );
+        let serialized_size = bincode::serialize(&transaction).unwrap().len();
+
+        assert_eq!(
+            serialized_size,
+            GENERIC_BUFFER_WRITE_TRANSACTION_OVERHEAD + GENERIC_BUFFER_CHUNK_SIZE
+        );
+        assert!(
+            serialized_size
+                <= SOLANA_TRANSACTION_SIZE_LIMIT - GENERIC_BUFFER_WRITE_TRANSACTION_SAFETY_MARGIN,
+            "serialized generic buffer write is {serialized_size} bytes"
+        );
     }
-    #[test] fn validates_artifact_lengths() {
-        let mut proof = [7u8; GROTH16_PROOF_SIZE]; let pv = [3u8; 32];
-        let output = format!("vk_hash: {EXPECTED_WITHDRAWAL_VK}");
-        validate_withdrawal_artifacts_inner(&proof, &pv, pv, &output).unwrap();
-        proof.fill(0);
-        assert!(validate_withdrawal_artifacts_inner(&proof, &pv, pv, &output).is_err());
+
+    #[test]
+    fn proof_payload_chunks_reconstruct_with_exact_offsets() {
+        let proof: Vec<u8> = (0..1_056).map(|index| (index % 251) as u8).collect();
+        let chunks = generic_buffer_chunks(&proof)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(chunks.len() >= 2);
+        let mut reconstructed = vec![0u8; proof.len()];
+        let mut expected_offset = 0usize;
+        for (offset, chunk) in chunks {
+            let offset = offset as usize;
+            assert_eq!(offset, expected_offset);
+            reconstructed[offset..offset + chunk.len()].copy_from_slice(chunk);
+            expected_offset += chunk.len();
+        }
+        assert_eq!(expected_offset, proof.len());
+        assert_eq!(reconstructed, proof);
     }
-    fn validate_withdrawal_artifacts_inner(proof: &[u8], pubvals: &[u8], expected: [u8; 32], output: &str) -> Result<()> {
-        if proof.len() != GROTH16_PROOF_SIZE { bail!("size") }
-        if proof.iter().all(|b| *b == 0) { bail!("zero") }
-        if pubvals != expected { bail!("values") }
-        if !output.to_ascii_lowercase().contains(&EXPECTED_WITHDRAWAL_VK.to_ascii_lowercase()) { bail!("vk") }
-        Ok(())
-    }
-    #[test] fn enforces_queue_order() {
-        assert!(ensure_next_unprocessed(&IndexedRequest { index: 4, record: record(4, 100, 0) }, 3).is_err());
-        assert!(ensure_next_unprocessed(&IndexedRequest { index: 4, record: record(4, 100, 0) }, 4).is_ok());
-    }
-    #[test] fn exact_satoshi_decimal() {
-        assert_eq!(sats_to_doge_number(39_199_000).unwrap().to_string(), "0.39199");
-        assert_eq!(sats_to_doge_number(100_000_000).unwrap().to_string(), "1");
-        assert_eq!(sats_to_doge_number(1).unwrap().to_string(), "0.00000001");
+}
+
+fn store_request(
+    request: &IndexedRequest,
+    fee_sats: u64,
+    net_sats: u64,
+    status: OperatorStatus,
+) -> WithdrawalRequest {
+    WithdrawalRequest {
+        request_index: request.index,
+        solana_signature: request.record.signature.to_string(),
+        solana_slot: request.record.slot,
+        block_time: request.record.block_time,
+        user_pubkey: request.record.user_pubkey.to_string(),
+        gross_amount_sats: request.record.amount_sats,
+        fee_amount_sats: fee_sats,
+        net_amount_sats: net_sats,
+        address_type: request.record.address_type,
+        recipient: request.record.recipient_address,
+        status,
     }
 }
