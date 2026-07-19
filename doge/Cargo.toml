@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[[bin]]
+name = "doge-solana-cli"
+path = "src/main.rs"
+
 [workspace]
 
 [dependencies]
@@ -27,6 +31,7 @@ hex = "0.4"
 # TODO: switch to git dep when bridge is pushed to devnet branch
 # psy-bridge-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", default-features = false, features = ["std", "serialize_bytemuck", "sha2"] }
 psy-bridge-core = { path = "../../psy-doge-solana-bridge/libraries/psy-bridge-core", default-features = false, features = ["std", "serialize_bytemuck", "serialize_serde", "sha2"] }
+libc = "0.2"
 # TODO: switch to git dep when bridge is pushed to devnet branch
 # psy-doge-solana-core = { git = "https://github.com/PsyProtocol/psy-doge-solana-bridge.git", branch = "devnet", default-features = false, features = ["std", "serialize_bytemuck", "fake_signer"] }
 psy-doge-solana-core = { path = "../../psy-doge-solana-bridge/libraries/psy-doge-solana-core", default-features = false, features = ["std", "serialize_bytemuck", "serialize_serde", "fake_signer"] }

@@ -1,7 +1,9 @@
 //! Deterministic local-regtest Manager/VAA HTTP service.
 //!
-//! This binary embeds known private keys and MUST NOT be exposed to a public
-//! network or used with funds outside an isolated Dogecoin regtest.
+//! Operators submit the outputs-only UTX0 payload together with selected
+//! custody inputs, transaction outputs, and the exact unsigned transaction.
+//! The service validates and signs that operator-built transaction with the
+//! deterministic local 5-of-7 Manager set.
 
 use std::{
     net::SocketAddr,
@@ -17,18 +19,23 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use doge_local_ops::wormhole::manager::{
-    LocalManagerService, LocalWithdrawalRegistration, SignedVaaResponse, VaaKey,
-};
 use serde::{Deserialize, Serialize};
+
+use crate::wormhole::{
+    manager::{
+        LocalManagerService, LocalSigningInput, LocalWithdrawalRegistration, SignedVaaResponse,
+        VaaKey,
+    },
+    tx::TransactionOutput,
+    utx0::UtxoAddressType,
+};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "local-manager-service",
-    about = "LOCAL REGTEST ONLY: synthesize UTX0 VAAs and deterministic manager signatures"
+    about = "LOCAL REGTEST ONLY: validate and sign operator-built Dogecoin withdrawals"
 )]
-struct Args {
-    /// Listen address. Keep this loopback-only unless the surrounding network is isolated.
+pub struct Args {
     #[arg(long, default_value = "127.0.0.1:7071")]
     listen: SocketAddr,
 }
@@ -42,6 +49,25 @@ struct RegisterWithdrawalRequest {
     emitter_address_hex: String,
     sequence: u64,
     payload_hex: String,
+    unsigned_transaction_hex: String,
+    inputs: Vec<SigningInputRequest>,
+    outputs: Vec<SigningOutputRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SigningInputRequest {
+    original_recipient_address_hex: String,
+    transaction_id_hex: String,
+    vout: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SigningOutputRequest {
+    amount: u64,
+    address_type: u32,
+    address_hex: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,21 +80,18 @@ struct ErrorResponse {
     error: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+pub async fn run(args: Args) -> Result<()> {
     let state = Arc::new(RwLock::new(LocalManagerService::default()));
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
-        .with_context(|| format!("bind local manager service to {}", args.listen))?;
-
+        .with_context(|| format!("bind local Manager service to {}", args.listen))?;
     eprintln!(
-        "LOCAL REGTEST ONLY: manager service listening on http://{}",
+        "LOCAL REGTEST ONLY: Manager service listening on http://{}",
         listener.local_addr()?
     );
     axum::serve(listener, app(state))
         .await
-        .context("serve local manager HTTP API")
+        .context("serve local Manager HTTP API")
 }
 
 fn app(state: SharedState) -> Router {
@@ -94,13 +117,12 @@ async fn register_withdrawal(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
     let sequence = registration.key.sequence;
-
     let mut service = match state.write() {
         Ok(service) => service,
         Err(_) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                anyhow!("local manager state lock poisoned"),
+                anyhow!("local Manager state lock poisoned"),
             )
         }
     };
@@ -110,7 +132,7 @@ async fn register_withdrawal(
             Json(RegisterWithdrawalResponse { sequence }),
         )
             .into_response(),
-        Err(error) if error.to_string().starts_with("conflicting payload") => {
+        Err(error) if error.to_string().starts_with("conflicting") => {
             api_error(StatusCode::CONFLICT, error)
         }
         Err(error) => api_error(StatusCode::BAD_REQUEST, error),
@@ -130,7 +152,7 @@ async fn get_manager_signatures(
         Err(_) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                anyhow!("local manager state lock poisoned"),
+                anyhow!("local Manager state lock poisoned"),
             )
         }
     };
@@ -156,7 +178,7 @@ async fn get_signed_vaa(
         Err(_) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                anyhow!("local manager state lock poisoned"),
+                anyhow!("local Manager state lock poisoned"),
             )
         }
     };
@@ -175,23 +197,64 @@ fn decode_registration(request: RegisterWithdrawalRequest) -> Result<LocalWithdr
         &request.emitter_address_hex,
         request.sequence,
     )?;
-    let payload = decode_hex("payloadHex", &request.payload_hex)?;
-    Ok(LocalWithdrawalRegistration { key, payload })
+    let inputs = request
+        .inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, input)| {
+            Ok(LocalSigningInput {
+                original_recipient_address: decode_fixed(
+                    &format!("inputs[{index}].originalRecipientAddressHex"),
+                    &input.original_recipient_address_hex,
+                )?,
+                transaction_id: decode_fixed(
+                    &format!("inputs[{index}].transactionIdHex"),
+                    &input.transaction_id_hex,
+                )?,
+                vout: input.vout,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let outputs = request
+        .outputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, output)| {
+            Ok(TransactionOutput {
+                amount: output.amount,
+                address_type: UtxoAddressType::from_u32(output.address_type)?,
+                address: decode_fixed(
+                    &format!("outputs[{index}].addressHex"),
+                    &output.address_hex,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LocalWithdrawalRegistration {
+        key,
+        payload: decode_hex("payloadHex", &request.payload_hex)?,
+        unsigned_transaction: decode_hex(
+            "unsignedTransactionHex",
+            &request.unsigned_transaction_hex,
+        )?,
+        inputs,
+        outputs,
+    })
 }
 
 fn decode_key(chain: u16, emitter_hex: &str, sequence: u64) -> Result<VaaKey> {
-    let emitter = decode_hex("emitterAddressHex", emitter_hex)?;
-    let emitter_address: [u8; 32] = emitter.try_into().map_err(|bytes: Vec<u8>| {
-        anyhow!(
-            "emitterAddressHex must decode to 32 bytes, got {}",
-            bytes.len()
-        )
-    })?;
     Ok(VaaKey {
         emitter_chain: chain,
-        emitter_address,
+        emitter_address: decode_fixed("emitterAddressHex", emitter_hex)?,
         sequence,
     })
+}
+
+fn decode_fixed<const N: usize>(field: &str, value: &str) -> Result<[u8; N]> {
+    let bytes = decode_hex(field, value)?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| anyhow!("{field} must decode to {N} bytes, got {}", bytes.len()))
 }
 
 fn decode_hex(field: &str, value: &str) -> Result<Vec<u8>> {
@@ -214,91 +277,100 @@ mod tests {
     use super::*;
     use axum::{
         body::{to_bytes, Body},
-        http::{Request, StatusCode},
+        http::Request,
     };
     use base64::{engine::general_purpose, Engine as _};
-    use doge_local_ops::wormhole::{
-        manager::{
-            fetch_manager_signatures, fetch_signed_vaa, local_regtest_manager_set,
-            parse_manager_signatures, parse_vaa, verify_manager_signature,
-        },
-        redeem::build_redeem_script,
-        tx::UnsignedTransaction,
-        utx0::{Utx0Input, Utx0Output, Utx0UnlockPayload, UtxoAddressType},
-    };
-    use serde_json::Value;
     use tower::ServiceExt;
 
-    fn payload() -> Vec<u8> {
-        Utx0UnlockPayload {
+    use crate::wormhole::{
+        manager::{
+            fetch_manager_signatures, fetch_signed_vaa, local_regtest_manager_set, parse_vaa,
+            verify_manager_signature,
+        },
+        redeem::build_redeem_script,
+        tx::{SelectedUtxo, TransactionOutput, UnsignedTransaction},
+        utx0::{Utx0Output, Utx0UnlockPayload, UtxoAddressType},
+    };
+
+    fn fixture() -> (Vec<u8>, UnsignedTransaction, serde_json::Value) {
+        let payload = Utx0UnlockPayload {
             destination_chain: 65,
             delegated_manager_set_index: 0,
-            inputs: vec![Utx0Input {
-                original_recipient_address: [0x11; 32],
-                transaction_id: [0x22; 32],
-                vout: 3,
-            }],
             outputs: vec![Utx0Output {
                 amount: 1_000_000,
                 address_type: UtxoAddressType::P2pkh,
-                address: vec![0x33; 20],
+                address: [0x33; 20],
             }],
         }
         .serialize()
-        .unwrap()
-    }
-
-    fn registration_body(payload: &[u8]) -> String {
-        serde_json::json!({
+        .unwrap();
+        let manager_set = local_regtest_manager_set();
+        let recipient = [0x11; 32];
+        let transaction_id = [0x22; 32];
+        let transaction = UnsignedTransaction::new(
+            vec![SelectedUtxo {
+                transaction_id,
+                vout: 3,
+                redeem_script: build_redeem_script(
+                    1,
+                    &[0x44; 32],
+                    &recipient,
+                    manager_set.m,
+                    &manager_set.pubkeys,
+                )
+                .unwrap(),
+            }],
+            vec![TransactionOutput {
+                amount: 1_000_000,
+                address_type: UtxoAddressType::P2pkh,
+                address: [0x33; 20],
+            }],
+        )
+        .unwrap();
+        let body = serde_json::json!({
             "emitterChain": 1,
             "emitterAddressHex": hex::encode([0x44; 32]),
             "sequence": 17,
-            "payloadHex": hex::encode(payload),
-        })
-        .to_string()
+            "payloadHex": hex::encode(&payload),
+            "unsignedTransactionHex": hex::encode(transaction.serialize()),
+            "inputs": [{
+                "originalRecipientAddressHex": hex::encode(recipient),
+                "transactionIdHex": hex::encode(transaction_id),
+                "vout": 3,
+            }],
+            "outputs": [{
+                "amount": 1_000_000,
+                "addressType": 0,
+                "addressHex": hex::encode([0x33; 20]),
+            }],
+        });
+        (payload, transaction, body)
     }
 
-    async fn body_json(response: Response) -> Value {
+    async fn body_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]
-    async fn api_returns_parseable_vaa_and_verifiable_signatures() {
+    async fn api_signs_operator_built_transaction() {
         let app = app(Arc::new(RwLock::new(LocalManagerService::default())));
-        let payload_bytes = payload();
+        let (_, transaction, body) = fixture();
         let register = app
             .clone()
             .oneshot(
                 Request::post("/api/v1/withdrawals")
                     .header("content-type", "application/json")
-                    .body(Body::from(registration_body(&payload_bytes)))
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(register.status(), StatusCode::OK);
-        assert_eq!(body_json(register).await["sequence"], 17);
 
         let emitter_hex = hex::encode([0x44; 32]);
-        let vaa_response = app
+        let response = app
             .clone()
-            .oneshot(
-                Request::get(format!("/v1/signed_vaa/1/{emitter_hex}/17"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(vaa_response.status(), StatusCode::OK);
-        let vaa_json = body_json(vaa_response).await;
-        let vaa = general_purpose::STANDARD
-            .decode(vaa_json["vaaBytes"].as_str().unwrap())
-            .unwrap();
-        let parsed = parse_vaa(&vaa).unwrap();
-        assert_eq!(parsed.payload, payload_bytes);
-
-        let manager_response = app
             .oneshot(
                 Request::get(format!("/v1/manager/signed_vaa/1/{emitter_hex}/17"))
                     .body(Body::empty())
@@ -306,41 +378,27 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(manager_response.status(), StatusCode::OK);
-        let manager_json = body_json(manager_response).await;
-        let signatures = parse_manager_signatures(&manager_json.to_string()).unwrap();
+        let manager = body_json(response).await;
+        assert_eq!(manager["isComplete"], true);
+        assert_eq!(manager["signatures"].as_array().unwrap().len(), 5);
 
-        let payload = Utx0UnlockPayload::parse(&parsed.payload).unwrap();
-        let manager_set = local_regtest_manager_set();
-        let scripts = payload
-            .inputs
-            .iter()
-            .map(|input| {
-                build_redeem_script(
-                    parsed.emitter_chain,
-                    &parsed.emitter_address,
-                    &input.original_recipient_address,
-                    manager_set.m,
-                    &manager_set.pubkeys,
-                )
-            })
-            .collect::<Result<Vec<_>>>()
+        let vaa_response = app
+            .oneshot(
+                Request::get(format!("/v1/signed_vaa/1/{emitter_hex}/17"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        let tx = UnsignedTransaction::from_utx0(&payload, scripts).unwrap();
-        for signer in signatures.signatures {
-            for (input_index, signature) in signer.input_signatures.iter().enumerate() {
-                assert!(verify_manager_signature(
-                    &manager_set.pubkeys[signer.signer_index as usize],
-                    &tx.sighash_all(input_index).unwrap(),
-                    signature,
-                )
-                .unwrap());
-            }
-        }
+        let vaa = general_purpose::STANDARD
+            .decode(body_json(vaa_response).await["vaaBytes"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(parse_vaa(&vaa).unwrap().sequence, 17);
+        assert_eq!(transaction.input_count(), 1);
     }
 
     #[tokio::test]
-    async fn live_server_is_compatible_with_existing_fetch_clients() {
+    async fn live_fetch_clients_receive_verifiable_signatures() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -353,60 +411,51 @@ mod tests {
         });
         let base_url = format!("http://{address}");
         let client = reqwest::Client::new();
-        let payload_bytes = payload();
-
-        let registration = client
+        let (_, transaction, body) = fixture();
+        assert!(client
             .post(format!("{base_url}/api/v1/withdrawals"))
-            .header("content-type", "application/json")
-            .body(registration_body(&payload_bytes))
+            .json(&body)
             .send()
             .await
-            .unwrap();
-        assert_eq!(registration.status(), StatusCode::OK);
-
+            .unwrap()
+            .status()
+            .is_success());
         let emitter = [0x44; 32];
         let signatures = fetch_manager_signatures(&client, &base_url, 1, &emitter, 17)
             .await
             .unwrap();
+        assert!(signatures.is_complete);
+        assert_eq!(signatures.signatures.len(), 5);
         let vaa = fetch_signed_vaa(&client, &base_url, 1, &emitter, 17)
             .await
             .unwrap();
-        assert_eq!(parse_vaa(&vaa).unwrap().payload, payload_bytes);
-        assert!(signatures.is_complete);
-        assert_eq!(signatures.signatures.len(), 5);
+        assert_eq!(parse_vaa(&vaa).unwrap().sequence, 17);
 
+        let manager_set = local_regtest_manager_set();
+        for signer in signatures.signatures {
+            assert!(verify_manager_signature(
+                &manager_set.pubkeys[signer.signer_index as usize],
+                &transaction.sighash_all(0).unwrap(),
+                &signer.input_signatures[0],
+            )
+            .unwrap());
+        }
         server.abort();
     }
-    #[tokio::test]
-    async fn duplicate_conflicting_registration_is_rejected() {
-        let app = app(Arc::new(RwLock::new(LocalManagerService::default())));
-        let payload_bytes = payload();
-        for _ in 0..2 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::post("/api/v1/withdrawals")
-                        .header("content-type", "application/json")
-                        .body(Body::from(registration_body(&payload_bytes)))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
 
-        let mut conflicting = payload_bytes;
-        let last = conflicting.len() - 1;
-        conflicting[last] ^= 1;
-        let response = app
+    #[tokio::test]
+    async fn rejects_transaction_that_does_not_match_authorized_outputs() {
+        let (_, _, mut body) = fixture();
+        body["outputs"][0]["amount"] = serde_json::json!(2_000_000);
+        let response = app(Arc::new(RwLock::new(LocalManagerService::default())))
             .oneshot(
                 Request::post("/api/v1/withdrawals")
                     .header("content-type", "application/json")
-                    .body(Body::from(registration_body(&conflicting)))
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

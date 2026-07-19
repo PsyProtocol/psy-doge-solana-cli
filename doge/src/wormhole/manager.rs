@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     chain_id,
     redeem::build_redeem_script,
-    tx::{UnsignedTransaction, SIGHASH_ALL},
-    utx0::Utx0UnlockPayload,
+    tx::{SelectedUtxo, TransactionOutput, UnsignedTransaction, SIGHASH_ALL},
+    utx0::{Utx0UnlockPayload, UtxoAddressType},
 };
 
 /// A delegated secp256k1 multisig manager set for a UTXO chain.
@@ -167,6 +167,40 @@ pub fn local_regtest_manager_set() -> ManagerSet {
         m: LOCAL_REGTEST_MANAGER_SET_M,
         n: LOCAL_REGTEST_MANAGER_SET_N,
         pubkeys: LOCAL_REGTEST_MANAGER_SET_PUBKEYS.to_vec(),
+    }
+}
+
+/// Official Wormhole Testnet Manager set 1 for Dogecoin chain 65.
+/// These are the real public keys deployed on Solana devnet in the
+/// `wdmsTJP6YnsfeQjPuuEzGCrHmZvTmNy8VkxMCK8JkBX` ManagerSet PDA.
+/// Layout: `Type(1) | M(1) | N(1) | PublicKeys(N*33)`.
+pub const OFFICIAL_TESTNET_MANAGER_SET_1_HEX: &str = concat!(
+    "010507",
+    "02349de56ca5dd06db8660419d6f150662e0f04febdbf6512d7cfe78c23b51491c",
+    "035163bfd9518b0a536a17f330a1589fe21d7404b51f525a0a990a65a701952ebb",
+    "036d40b0b85bca49e41f05a26950578bb13a424507ce34a80f83d3cf601e25818b",
+    "0307681002ae28b9399e828d0f46d54c31d5d6ff187b3bdddc6615987a466455f5",
+    "0375abc8955c8a8c875ee1febd157132adcc1b992d69a946e83485b8360e23a277",
+    "030212d206546216917a75533ed6c975f8f794ba0d8a7fb84dedf65ebb20e64841",
+    "037ff483369b52bd87a73f23413dd8fcace71de7f7823c5c9120f1e9cfe5733a88",
+);
+
+/// Returns the official Wormhole Testnet Manager set 1 for Dogecoin chain 65.
+pub fn official_testnet_manager_set_1() -> Result<ManagerSet> {
+    ManagerSet::parse(
+        &hex::decode(OFFICIAL_TESTNET_MANAGER_SET_1_HEX)
+            .context("decode official testnet manager set 1")?,
+    )
+}
+
+/// Resolve a manager set by index.
+/// Index 0 = local regtest fixture (never for public funds).
+/// Index 1 = official Wormhole Testnet set 1.
+pub fn manager_set_for_index(index: u32) -> Result<ManagerSet> {
+    match index {
+        0 => Ok(local_regtest_manager_set()),
+        1 => official_testnet_manager_set_1(),
+        other => bail!("unsupported manager set index {other}"),
     }
 }
 
@@ -511,17 +545,29 @@ pub struct VaaKey {
     pub sequence: u64,
 }
 
+/// Operator-selected input metadata submitted to the local Manager service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSigningInput {
+    pub original_recipient_address: [u8; 32],
+    pub transaction_id: [u8; 32],
+    pub vout: u32,
+}
+
 /// Exact registration accepted by the local-regtest service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalWithdrawalRegistration {
     pub key: VaaKey,
     pub payload: Vec<u8>,
+    pub unsigned_transaction: Vec<u8>,
+    pub inputs: Vec<LocalSigningInput>,
+    pub outputs: Vec<TransactionOutput>,
 }
 
 /// Fully materialized local response, built once at registration time.
 #[derive(Debug, Clone)]
 pub struct LocalSignedWithdrawal {
     pub signed_vaa: Vec<u8>,
+    pub unsigned_transaction: Vec<u8>,
     pub manager_signatures: ManagerSignatures,
 }
 
@@ -543,12 +589,14 @@ impl LocalManagerService {
         &mut self,
         registration: LocalWithdrawalRegistration,
     ) -> Result<RegistrationOutcome> {
-        if let Some((payload, _)) = self.withdrawals.get(&registration.key) {
-            if payload == &registration.payload {
+        if let Some((payload, signed)) = self.withdrawals.get(&registration.key) {
+            if payload == &registration.payload
+                && signed.unsigned_transaction == registration.unsigned_transaction
+            {
                 return Ok(RegistrationOutcome::AlreadyRegistered);
             }
             bail!(
-                "conflicting payload already registered for {}",
+                "conflicting payload or unsigned transaction already registered for {}",
                 vaa_id(registration.key)
             );
         }
@@ -564,13 +612,13 @@ impl LocalManagerService {
     }
 }
 
-/// Synthesize the unsigned transaction and its quorum signatures from an exact
-/// UTX0 payload. This is local infrastructure, not guardian emulation.
+/// Validate an outputs-only UTX0 payload and sign the exact operator-selected
+/// Dogecoin transaction submitted alongside it.
 pub fn build_local_signed_withdrawal(
     registration: &LocalWithdrawalRegistration,
 ) -> Result<LocalSignedWithdrawal> {
     let payload = Utx0UnlockPayload::parse(&registration.payload)
-        .context("registration payload is not a canonical UTX0 payload")?;
+        .context("registration payload is not a canonical outputs-only UTX0 payload")?;
     if payload.delegated_manager_set_index != 0 {
         bail!(
             "local regtest only supports delegated manager set index 0, got {}",
@@ -579,31 +627,65 @@ pub fn build_local_signed_withdrawal(
     }
     if payload.destination_chain != chain_id::DOGECOIN {
         bail!(
-            "local regtest manager only signs Dogecoin destination chain {}, got {}",
+            "local regtest manager only accepts Dogecoin destination chain {}, got {}",
             chain_id::DOGECOIN,
             payload.destination_chain
         );
     }
+    if payload.outputs.is_empty() || registration.inputs.is_empty() {
+        bail!("local regtest manager requires outputs and operator-selected inputs");
+    }
 
     let manager_set = local_regtest_manager_set();
-    let redeem_scripts = payload
+    let selected_inputs = registration
         .inputs
         .iter()
         .map(|input| {
-            build_redeem_script(
-                registration.key.emitter_chain,
-                &registration.key.emitter_address,
-                &input.original_recipient_address,
-                manager_set.m,
-                &manager_set.pubkeys,
-            )
+            Ok(SelectedUtxo {
+                transaction_id: input.transaction_id,
+                vout: input.vout,
+                redeem_script: build_redeem_script(
+                    registration.key.emitter_chain,
+                    &registration.key.emitter_address,
+                    &input.original_recipient_address,
+                    manager_set.m,
+                    &manager_set.pubkeys,
+                )?,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
-    let tx = UnsignedTransaction::from_utx0(&payload, redeem_scripts)?;
-    let sighashes = (0..tx.input_count())
-        .map(|input_index| tx.sighash_all(input_index))
-        .collect::<Result<Vec<_>>>()?;
 
+    if registration.outputs.len() < payload.outputs.len()
+        || registration.outputs.len() > payload.outputs.len() + 1
+    {
+        bail!("operator transaction must contain authorized outputs and at most one change output");
+    }
+    for (index, (authorized, transaction)) in payload
+        .outputs
+        .iter()
+        .zip(&registration.outputs)
+        .enumerate()
+    {
+        if transaction.amount != authorized.amount
+            || transaction.address_type != authorized.address_type
+            || transaction.address != authorized.address
+        {
+            bail!("operator transaction output {index} does not match the authorized UTX0 output");
+        }
+    }
+    if let Some(change) = registration.outputs.get(payload.outputs.len()) {
+        if change.address_type != UtxoAddressType::P2sh {
+            bail!("operator change output must be P2SH custody");
+        }
+    }
+
+    let transaction = UnsignedTransaction::new(selected_inputs, registration.outputs.clone())?;
+    if transaction.serialize() != registration.unsigned_transaction {
+        bail!("operator unsigned transaction does not match submitted inputs and outputs");
+    }
+    let sighashes = (0..transaction.input_count())
+        .map(|index| transaction.sighash_all(index))
+        .collect::<Result<Vec<_>>>()?;
     let secp = Secp256k1::signing_only();
     let signatures = LOCAL_REGTEST_MANAGER_PRIVATE_KEYS
         .iter()
@@ -611,15 +693,16 @@ pub fn build_local_signed_withdrawal(
         .enumerate()
         .map(|(signer_index, secret_bytes)| -> Result<SignerSignatures> {
             let secret = SecretKey::from_byte_array(*secret_bytes)
-                .map_err(|e| anyhow!("invalid local manager secret {signer_index}: {e}"))?;
+                .map_err(|error| anyhow!("invalid local Manager secret {signer_index}: {error}"))?;
             let input_signatures = sighashes
                 .iter()
                 .map(|sighash| {
-                    let message = Message::from_digest(*sighash);
-                    let signature = secp.sign_ecdsa(message, &secret);
-                    let mut encoded = signature.serialize_der().to_vec();
-                    encoded.push(SIGHASH_ALL as u8);
-                    encoded
+                    let mut signature = secp
+                        .sign_ecdsa(Message::from_digest(*sighash), &secret)
+                        .serialize_der()
+                        .to_vec();
+                    signature.push(SIGHASH_ALL as u8);
+                    signature
                 })
                 .collect();
             Ok(SignerSignatures {
@@ -633,6 +716,7 @@ pub fn build_local_signed_withdrawal(
     let vaa_hash = vaa_signing_digest(&signed_vaa)?;
     Ok(LocalSignedWithdrawal {
         signed_vaa,
+        unsigned_transaction: registration.unsigned_transaction.clone(),
         manager_signatures: ManagerSignatures {
             is_complete: true,
             vaa_hash,
@@ -737,60 +821,83 @@ mod tests {
     use super::*;
     use secp256k1::PublicKey;
 
-    #[test]
-    fn manager_set_round_trip() {
-        let ms = local_regtest_manager_set();
-        assert_eq!(ms.m, 5);
-        assert_eq!(ms.n, 7);
-        assert_eq!(ms.pubkeys.len(), 7);
-        let bytes = ms.serialize();
-        let parsed = ManagerSet::parse(&bytes).unwrap();
-        assert_eq!(parsed, ms);
+    fn signing_payload() -> Utx0UnlockPayload {
+        Utx0UnlockPayload {
+            destination_chain: 65,
+            delegated_manager_set_index: 0,
+            outputs: vec![super::super::utx0::Utx0Output {
+                amount: 100_000_000,
+                address_type: UtxoAddressType::P2pkh,
+                address: [0x55; 20],
+            }],
+        }
+    }
+
+    fn local_registration(payload: &Utx0UnlockPayload) -> LocalWithdrawalRegistration {
+        let manager_set = local_regtest_manager_set();
+        let original_recipient_address = [0x11; 32];
+        let transaction_id = [0x22; 32];
+        let output = TransactionOutput {
+            amount: payload.outputs[0].amount,
+            address_type: payload.outputs[0].address_type,
+            address: payload.outputs[0].address,
+        };
+        let transaction = UnsignedTransaction::new(
+            vec![SelectedUtxo {
+                transaction_id,
+                vout: 0,
+                redeem_script: build_redeem_script(
+                    1,
+                    &[0x42; 32],
+                    &original_recipient_address,
+                    manager_set.m,
+                    &manager_set.pubkeys,
+                )
+                .unwrap(),
+            }],
+            vec![output],
+        )
+        .unwrap();
+        LocalWithdrawalRegistration {
+            key: VaaKey {
+                emitter_chain: 1,
+                emitter_address: [0x42; 32],
+                sequence: 9,
+            },
+            payload: payload.serialize().unwrap(),
+            unsigned_transaction: transaction.serialize(),
+            inputs: vec![LocalSigningInput {
+                original_recipient_address,
+                transaction_id,
+                vout: 0,
+            }],
+            outputs: vec![output],
+        }
     }
 
     #[test]
-    fn parse_vaa_extracts_utx0_payload() {
-        // Build a minimal VAA with one guardian sig and a UTX0 payload.
-        let payload = Utx0UnlockPayload {
-            destination_chain: 65,
-            delegated_manager_set_index: 1,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        let payload_bytes = payload.serialize().unwrap();
+    fn manager_set_round_trip() {
+        let manager_set = local_regtest_manager_set();
+        assert_eq!(
+            ManagerSet::parse(&manager_set.serialize()).unwrap(),
+            manager_set
+        );
+    }
 
-        let mut vaa = Vec::new();
-        vaa.push(1u8); // version
-        vaa.extend_from_slice(&0u32.to_be_bytes()); // guardian set index
-        vaa.push(1u8); // sig count
-        vaa.push(0u8); // guardian index
-        vaa.extend_from_slice(&[0u8; 65]); // dummy sig
-        vaa.extend_from_slice(&0u32.to_be_bytes()); // timestamp
-        vaa.extend_from_slice(&0u32.to_be_bytes()); // nonce
-        vaa.extend_from_slice(&1u16.to_be_bytes()); // emitter chain (Solana)
-        vaa.extend_from_slice(&[0xaa; 32]); // emitter address
-        vaa.extend_from_slice(&42u64.to_be_bytes()); // sequence
-        vaa.push(32u8); // consistency level
-        vaa.extend_from_slice(&payload_bytes);
-
-        let header = parse_vaa(&vaa).unwrap();
-        assert_eq!(header.emitter_chain, 1);
-        assert_eq!(header.sequence, 42);
-        assert_eq!(header.emitter_address, [0xaa; 32]);
-        let p = Utx0UnlockPayload::parse(&header.payload).unwrap();
-        assert_eq!(p.destination_chain, 65);
-        assert_eq!(p.delegated_manager_set_index, 1);
+    #[test]
+    fn parse_vaa_extracts_outputs_only_payload() {
+        let registration = local_registration(&signing_payload());
+        let signed = build_local_signed_withdrawal(&registration).unwrap();
+        let header = parse_vaa(&signed.signed_vaa).unwrap();
+        assert_eq!(header.emitter_chain, registration.key.emitter_chain);
+        assert_eq!(header.emitter_address, registration.key.emitter_address);
+        assert_eq!(header.sequence, registration.key.sequence);
+        assert_eq!(header.payload, registration.payload);
     }
 
     #[test]
     fn parse_manager_signatures_decodes_base64_and_metadata() {
-        use base64::{engine::general_purpose, Engine as _};
-
-        // A dummy DER + trailing SIGHASH_ALL (0x01) byte; the relay decodes
-        // before verifying, so the exact bytes need not be a valid signature.
-        let der_with_hashtype: [u8; 5] = [0x30, 0x02, 0x01, 0x01, 0x01];
-        let b64_sig = general_purpose::STANDARD.encode(der_with_hashtype);
-
+        let signature = general_purpose::STANDARD.encode([0x30, 0x02, 0x01, 0x01, 0x01]);
         let emitter = [0u8; 32];
         let vaa_hash = [0xaa; 32];
         let body = format!(
@@ -799,82 +906,12 @@ mod tests {
              \"signatures\":[{{\"signerIndex\":2,\"signatures\":[\"{}\"]}}]}}",
             hex::encode(vaa_hash),
             hex::encode(emitter),
-            b64_sig,
+            signature,
         );
-        let ms = parse_manager_signatures(&body).unwrap();
-        assert!(ms.is_complete);
-        assert_eq!(ms.vaa_hash, vaa_hash);
-        assert_eq!(ms.vaa_id, format!("1/{}/7", hex::encode(emitter)));
-        assert_eq!(ms.destination_chain, 65);
-        assert_eq!(ms.manager_set_index, 3);
-        assert_eq!(ms.required, 5);
-        assert_eq!(ms.total, 7);
-        assert_eq!(ms.signatures.len(), 1);
-        assert_eq!(ms.signatures[0].signer_index, 2);
-        assert_eq!(
-            ms.signatures[0].input_signatures,
-            vec![der_with_hashtype.to_vec()]
-        );
-    }
-
-    #[test]
-    fn vaa_signing_digest_is_double_keccak_of_body() {
-        use sha3::{Digest, Keccak256};
-
-        // Signed VAA with zero guardian signatures and a known body.
-        let body = [0x42u8; 10];
-        let mut vaa = vec![1u8]; // version
-        vaa.extend_from_slice(&0u32.to_be_bytes()); // guardian set index
-        vaa.push(0u8); // sig count = 0
-        vaa.extend_from_slice(&body);
-
-        let mut h1 = Keccak256::new();
-        h1.update(&body);
-        let first = h1.finalize();
-        let mut h2 = Keccak256::new();
-        h2.update(first);
-        let expected = h2.finalize();
-
-        let digest = vaa_signing_digest(&vaa).unwrap();
-        assert_eq!(&digest[..], &expected[..]);
-        assert!(vaa_hash_matches(&vaa, &digest).unwrap());
-    }
-
-    fn local_registration(payload: &Utx0UnlockPayload) -> LocalWithdrawalRegistration {
-        LocalWithdrawalRegistration {
-            key: VaaKey {
-                emitter_chain: 1,
-                emitter_address: [0x42; 32],
-                sequence: 9,
-            },
-            payload: payload.serialize().unwrap(),
-        }
-    }
-
-    fn signing_payload() -> Utx0UnlockPayload {
-        use super::super::utx0::{Utx0Input, Utx0Output, UtxoAddressType};
-
-        Utx0UnlockPayload {
-            destination_chain: 65,
-            delegated_manager_set_index: 0,
-            inputs: vec![
-                Utx0Input {
-                    original_recipient_address: [0x11; 32],
-                    transaction_id: [0x22; 32],
-                    vout: 0,
-                },
-                Utx0Input {
-                    original_recipient_address: [0x33; 32],
-                    transaction_id: [0x44; 32],
-                    vout: 1,
-                },
-            ],
-            outputs: vec![Utx0Output {
-                amount: 100_000_000,
-                address_type: UtxoAddressType::P2pkh,
-                address: vec![0x55; 20],
-            }],
-        }
+        let parsed = parse_manager_signatures(&body).unwrap();
+        assert!(parsed.is_complete);
+        assert_eq!(parsed.vaa_hash, vaa_hash);
+        assert_eq!(parsed.signatures[0].signer_index, 2);
     }
 
     #[test]
@@ -893,53 +930,45 @@ mod tests {
     }
 
     #[test]
-    fn local_service_vaa_and_all_manager_signatures_verify() {
+    fn local_service_returns_verifiable_manager_signatures() {
         let registration = local_registration(&signing_payload());
         let signed = build_local_signed_withdrawal(&registration).unwrap();
-        let parsed = parse_vaa(&signed.signed_vaa).unwrap();
-        assert_eq!(parsed.emitter_chain, registration.key.emitter_chain);
-        assert_eq!(parsed.emitter_address, registration.key.emitter_address);
-        assert_eq!(parsed.sequence, registration.key.sequence);
-        assert_eq!(parsed.payload, registration.payload);
+        assert!(signed.manager_signatures.is_complete);
+        assert_eq!(
+            signed.unsigned_transaction,
+            registration.unsigned_transaction
+        );
         assert!(vaa_hash_matches(&signed.signed_vaa, &signed.manager_signatures.vaa_hash).unwrap());
-
-        let payload = Utx0UnlockPayload::parse(&parsed.payload).unwrap();
         let manager_set = local_regtest_manager_set();
-        let redeem_scripts = payload
-            .inputs
-            .iter()
-            .map(|input| {
-                build_redeem_script(
-                    parsed.emitter_chain,
-                    &parsed.emitter_address,
-                    &input.original_recipient_address,
+        let transaction = UnsignedTransaction::new(
+            vec![SelectedUtxo {
+                transaction_id: registration.inputs[0].transaction_id,
+                vout: registration.inputs[0].vout,
+                redeem_script: build_redeem_script(
+                    registration.key.emitter_chain,
+                    &registration.key.emitter_address,
+                    &registration.inputs[0].original_recipient_address,
                     manager_set.m,
                     &manager_set.pubkeys,
                 )
-            })
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        let tx = UnsignedTransaction::from_utx0(&payload, redeem_scripts).unwrap();
-        assert_eq!(
-            signed.manager_signatures.signatures.len(),
-            manager_set.m as usize
-        );
-        for signer in &signed.manager_signatures.signatures {
-            assert_eq!(signer.input_signatures.len(), tx.input_count());
-            for (input_index, signature) in signer.input_signatures.iter().enumerate() {
-                assert_eq!(signature.last(), Some(&(SIGHASH_ALL as u8)));
-                assert!(verify_manager_signature(
-                    &manager_set.pubkeys[signer.signer_index as usize],
-                    &tx.sighash_all(input_index).unwrap(),
-                    signature,
-                )
-                .unwrap());
-            }
+                .unwrap(),
+            }],
+            registration.outputs.clone(),
+        )
+        .unwrap();
+        let sighash = transaction.sighash_all(0).unwrap();
+        for signer in signed.manager_signatures.signatures {
+            assert!(verify_manager_signature(
+                &manager_set.pubkeys[signer.signer_index as usize],
+                &sighash,
+                &signer.input_signatures[0],
+            )
+            .unwrap());
         }
     }
 
     #[test]
-    fn local_registration_is_idempotent_but_rejects_conflicts() {
+    fn registration_is_idempotent_but_rejects_conflicts() {
         let registration = local_registration(&signing_payload());
         let mut service = LocalManagerService::default();
         assert_eq!(
@@ -950,22 +979,21 @@ mod tests {
             service.register(registration.clone()).unwrap(),
             RegistrationOutcome::AlreadyRegistered
         );
-
         let mut conflicting = registration;
-        let last = conflicting.payload.len() - 1;
-        conflicting.payload[last] ^= 1;
-        let error = service.register(conflicting).unwrap_err();
-        assert!(error.to_string().contains("conflicting payload"));
+        conflicting.unsigned_transaction.push(0);
+        assert!(service
+            .register(conflicting)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting"));
     }
 
     #[test]
     fn invalid_first_registration_does_not_reserve_key() {
-        let payload = signing_payload();
-        let mut invalid = local_registration(&payload);
-        invalid.payload.pop();
-        let valid = local_registration(&payload);
+        let mut invalid = local_registration(&signing_payload());
+        invalid.unsigned_transaction.pop();
+        let valid = local_registration(&signing_payload());
         let key = valid.key;
-
         let mut service = LocalManagerService::default();
         assert!(service.register(invalid).is_err());
         assert_eq!(

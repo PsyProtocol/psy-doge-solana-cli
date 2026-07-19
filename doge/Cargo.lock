@@ -1475,6 +1475,7 @@ dependencies = [
  "doge-bridge-client",
  "doge-light-client",
  "hex",
+ "libc",
  "psy-bridge-core",
  "psy-doge-bridge-helper",
  "psy-doge-data-link",

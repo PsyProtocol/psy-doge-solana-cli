@@ -7,15 +7,16 @@ use bitcoin::{
     script::Builder,
     secp256k1::{Message, Secp256k1},
     sighash::{EcdsaSighashType, SighashCache},
-    transaction, Address, Amount, BlockHash, Network, OutPoint, PrivateKey, ScriptBuf, ScriptHash,
+    transaction, Address, Amount, BlockHash, OutPoint, PrivateKey, ScriptBuf, ScriptHash,
     Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
 use bs58;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use doge_bridge_client::operator_store::{CustodyUtxo, CustodyUtxoStatus, OperatorStore};
 use doge_bridge_client::{BridgeApi, BridgeClient, BridgeClientConfigBuilder};
-use doge_local_ops::wormhole::{manager::local_regtest_manager_set, redeem::build_redeem_script};
-use doge_local_ops::{custody_ops, SATS_PER_DOGE};
+use crate::network::{fill_string, fill_u32, DogeNetwork, RuntimeNetwork};
+use crate::wormhole::{manager::manager_set_for_index, redeem::build_redeem_script};
+use crate::{custody_ops, SATS_PER_DOGE};
 use reqwest::Client as HttpClient;
 use ripemd::{Digest as RipemdDigest, Ripemd160};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -33,90 +34,30 @@ use std::{
 use tokio::time::sleep;
 
 const DEFAULT_DOGE_BRIDGE: &str = "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ";
-const DEFAULT_NOOP_SHIM: &str = "FwDChsHWLwbhTiYQ4Sum5mjVWswECi9cmrA11GUFUuxi";
 const DEFAULT_CUSTODY_KEY_REFERENCE: &str = "bridge-custody-wallet#0";
 const DEFAULT_FEE_SATS: u64 = 1_000_000;
 const DOGE_DUST_LIMIT_SATS: u64 = SATS_PER_DOGE;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum NetworkProfile {
-    Regtest,
-    Testnet,
-}
-
-impl NetworkProfile {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Regtest => "regtest",
-            Self::Testnet => "testnet",
-        }
-    }
-
-    fn bitcoin_network(self) -> Network {
-        match self {
-            Self::Regtest => Network::Regtest,
-            Self::Testnet => Network::Testnet,
-        }
-    }
-
-    fn p2pkh_version(self) -> u8 {
-        match self {
-            Self::Regtest => 0x6f,
-            Self::Testnet => 0x71,
-        }
-    }
-
-    fn wif_version(self) -> u8 {
-        match self {
-            Self::Regtest => 0xef,
-            Self::Testnet => 0xf1,
-        }
-    }
-
-    fn encode_address(self, address_type: u32, payload: [u8; 20]) -> Result<String> {
-        let version = match address_type {
-            0 => self.p2pkh_version(),
-            1 => 0xc4,
-            other => bail!("unsupported Dogecoin address type {other}"),
-        };
-        let mut bytes = Vec::with_capacity(21);
-        bytes.push(version);
-        bytes.extend_from_slice(&payload);
-        Ok(bs58::encode(bytes).with_check().into_string())
-    }
-
-    fn validate_wif(self, wif: &str) -> Result<()> {
-        let decoded = bs58::decode(wif).with_check(None).into_vec()?;
-        if decoded.len() != 33 && decoded.len() != 34 {
-            bail!("Dogecoin WIF payload must be 33 or 34 bytes, got {}", decoded.len());
-        }
-        if decoded[0] != self.wif_version() {
-            bail!(
-                "WIF version 0x{:02x} does not match {} (expected 0x{:02x})",
-                decoded[0],
-                self.as_str(),
-                self.wif_version(),
-            );
-        }
-        if decoded.len() == 34 && decoded[33] != 1 {
-            bail!("compressed Dogecoin WIF is missing the 0x01 marker");
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Parser)]
 #[command(
-    name = "deposit-to-solana",
+    name = "deposit",
     about = "Send a Dogecoin deposit to bridge custody and register its confirmed UTXO",
-    long_about = "Derives the recipient-specific P2SH custody address, builds and signs one legacy Dogecoin funding transaction, broadcasts it through Electrs, passively waits for confirmation, registers the confirmed custody UTXO, and writes deposit evidence.",
-    after_long_help = "Select --network regtest (default) or --network testnet. Testnet validates P2PKH 0x71, P2SH 0xc4 and WIF 0xf1, and uses passive Electrs confirmation without dogecoind or mining. The WIF is never written to evidence."
+    long_about = "Derives the recipient-specific P2SH custody address, builds and signs one legacy Dogecoin funding transaction, broadcasts it through Electrs, passively waits for confirmation, registers the confirmed custody UTXO, and writes deposit evidence. Runtime endpoints and Dogecoin network are selected by the global --network flag."
 )]
-struct Args {
-    #[arg(long, value_enum, default_value_t = NetworkProfile::Regtest)]
-    network: NetworkProfile,
-    #[arg(long, default_value = "http://127.0.0.1:8899")]
-    solana_rpc_url: String,
+pub struct Args {
+    /// Internal Dogecoin address network; set from global --network.
+    #[arg(skip)]
+    doge_network: DogeNetwork,
+    /// Captured global runtime network for endpoint and identity validation.
+    #[arg(skip)]
+    runtime_network: RuntimeNetwork,
+    #[arg(
+        long,
+        help = "Manager set index override (default: 0 on localhost, 1 on devnet)"
+    )]
+    manager_set_index: Option<u32>,
+    #[arg(long, help = "Solana RPC URL override")]
+    solana_rpc_url: Option<String>,
     #[arg(long)]
     operator_keypair: PathBuf,
     #[arg(long)]
@@ -125,14 +66,16 @@ struct Args {
     recipient_token_account: Pubkey,
     #[arg(long, default_value = DEFAULT_DOGE_BRIDGE)]
     doge_bridge_program: Pubkey,
-    #[arg(long, default_value = DEFAULT_NOOP_SHIM)]
-    noop_shim_program: Pubkey,
+    #[arg(long, help = "Wormhole Core / noop program override")]
+    wormhole_core_program: Option<Pubkey>,
+    #[arg(long, help = "Wormhole Shim / noop program override")]
+    wormhole_shim_program: Option<Pubkey>,
     #[arg(long)]
     bridge_state: Option<Pubkey>,
-    #[arg(long, default_value = "http://127.0.0.1:3002")]
-    electrs_url: String,
-    #[arg(long)]
-    funding_wif: String,
+    #[arg(long, help = "Electrs HTTP URL override")]
+    electrs_url: Option<String>,
+    #[arg(long, help = "Mode-600 file containing only the funding Dogecoin WIF")]
+    funding_wif_file: PathBuf,
     #[arg(long)]
     funding_txid: Txid,
     #[arg(long)]
@@ -141,20 +84,6 @@ struct Args {
     funding_amount: u64,
     #[arg(long, default_value_t = SATS_PER_DOGE)]
     amount_sats: u64,
-    #[arg(
-        long,
-        default_value_t = 1,
-        value_parser = clap::value_parser!(u32).range(1..),
-        help = "Deprecated compatibility option; ignored because mining is external"
-    )]
-    mine_blocks: u32,
-    #[arg(
-        long,
-        default_value_t = 1,
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Deprecated compatibility option; ignored; the CLI waits for the first confirmation"
-    )]
-    min_confirmations: u64,
     #[arg(long, default_value_t = 120)]
     confirmation_timeout_secs: u64,
     #[arg(long, default_value_t = 500)]
@@ -167,13 +96,65 @@ struct Args {
     evidence_path: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
-struct ElectrsUtxo {
-    txid: Txid,
-    vout: u32,
-    value: u64,
-    status: ElectrsTxStatus,
+impl Args {
+    pub fn apply_network_defaults(&mut self, network: RuntimeNetwork) {
+        self.runtime_network = network;
+        let defaults = network.defaults();
+        self.doge_network = defaults.doge_network;
+        fill_u32(&mut self.manager_set_index, defaults.manager_set_index);
+        fill_string(&mut self.solana_rpc_url, defaults.solana_rpc_url);
+        fill_string(&mut self.electrs_url, defaults.electrs_url);
+        if self.wormhole_core_program.is_none() {
+            self.wormhole_core_program =
+                Some(defaults.wormhole_core_program.parse().expect("wormhole core"));
+        }
+        if self.wormhole_shim_program.is_none() {
+            self.wormhole_shim_program =
+                Some(defaults.wormhole_shim_program.parse().expect("wormhole shim"));
+        }
+    }
+
+    fn manager_set_index(&self) -> u32 {
+        self.manager_set_index
+            .expect("manager_set_index requires apply_network_defaults")
+    }
+
+    fn solana_rpc_url(&self) -> &str {
+        self.solana_rpc_url
+            .as_deref()
+            .expect("solana_rpc_url requires apply_network_defaults")
+    }
+
+    fn electrs_url(&self) -> &str {
+        self.electrs_url
+            .as_deref()
+            .expect("electrs_url requires apply_network_defaults")
+    }
+
+    fn wormhole_core_program(&self) -> Pubkey {
+        self.wormhole_core_program
+            .expect("wormhole_core_program requires apply_network_defaults")
+    }
+
+    fn wormhole_shim_program(&self) -> Pubkey {
+        self.wormhole_shim_program
+            .expect("wormhole_shim_program requires apply_network_defaults")
+    }
+
+    fn validate_network_boundary(&self) -> Result<()> {
+        self.runtime_network
+            .validate_remote_url("Solana RPC", self.solana_rpc_url())?;
+        self.runtime_network
+            .validate_remote_url("Electrs", self.electrs_url())?;
+        self.runtime_network
+            .validate_manager_set(self.manager_set_index())?;
+        self.runtime_network.validate_wormhole_programs(
+            &self.wormhole_core_program().to_string(),
+            &self.wormhole_shim_program().to_string(),
+        )
+    }
 }
+
 
 #[derive(Debug, Clone, Deserialize)]
 struct ElectrsTxStatus {
@@ -204,18 +185,60 @@ struct Evidence {
     custody: Value,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    run(Args::parse()).await
+fn read_funding_wif(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("open funding WIF file without following symlinks {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("read funding WIF file metadata {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("funding WIF path {} must be a regular file", path.display());
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            bail!(
+                "funding WIF file {} must have mode 600, got {:03o}",
+                path.display(),
+                mode,
+            );
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open funding WIF file {}", path.display()))?;
+
+    use std::io::Read;
+    let mut wif = String::new();
+    file.read_to_string(&mut wif)
+        .with_context(|| format!("read funding WIF file {}", path.display()))?;
+    let wif = wif.trim().to_owned();
+    if wif.is_empty() {
+        bail!("funding WIF file {} is empty", path.display());
+    }
+    Ok(wif)
 }
 
-async fn run(args: Args) -> Result<()> {
+pub async fn run(args: Args) -> Result<()> {
+    args.validate_network_boundary()?;
     if args.amount_sats < DOGE_DUST_LIMIT_SATS {
         bail!(
             "--amount-sats must be at least the Dogecoin dust limit of {DOGE_DUST_LIMIT_SATS} sats"
         );
     }
-    let _compatibility_only = (args.mine_blocks, args.min_confirmations);
+    let doge_network = args.doge_network;
+    let manager_set_index = args.manager_set_index();
+    let solana_rpc_url = args.solana_rpc_url().to_owned();
+    let electrs_url = args.electrs_url().to_owned();
+    let wormhole_core = args.wormhole_core_program();
+    let wormhole_shim = args.wormhole_shim_program();
+    let funding_wif = read_funding_wif(&args.funding_wif_file)?;
 
     let operator = read_keypair(&args.operator_keypair, "operator")?;
     let payer = read_keypair(&args.payer_keypair, "payer")?;
@@ -229,13 +252,13 @@ async fn run(args: Args) -> Result<()> {
 
     let bridge_client = BridgeClient::with_config(
         BridgeClientConfigBuilder::new()
-            .rpc_url(args.solana_rpc_url.clone())
+            .rpc_url(solana_rpc_url)
             .bridge_state_pda(derived_bridge_state)
             .operator(clone_keypair(&operator)?)
             .payer(clone_keypair(&payer)?)
             .program_id(args.doge_bridge_program)
-            .wormhole_core_program_id(args.noop_shim_program)
-            .wormhole_shim_program_id(args.noop_shim_program)
+            .wormhole_core_program_id(wormhole_core)
+            .wormhole_shim_program_id(wormhole_shim)
             .build()
             .context("build bridge client configuration")?,
     )
@@ -247,11 +270,12 @@ async fn run(args: Args) -> Result<()> {
 
     let store = OperatorStore::open(&args.operator_store).context("open operator store")?;
     let (deposit_address, script_hash) = p2sh_custody_address(
-        args.network,
+        doge_network,
         &derived_bridge_state,
         &args.recipient_token_account,
+        manager_set_index,
     )?;
-    let manager_set = local_regtest_manager_set();
+    let manager_set = manager_set_for_index(manager_set_index)?;
     let redeem_script = build_redeem_script(
         1,
         &derived_bridge_state.to_bytes(),
@@ -266,20 +290,20 @@ async fn run(args: Args) -> Result<()> {
         hex::encode(script_hash),
     );
 
-    args.network
-        .validate_wif(&args.funding_wif)
-        .context("validate --funding-wif network")?;
-    let funding_key = PrivateKey::from_wif(&args.funding_wif).context("parse --funding-wif")?;
-    if funding_key.network != args.network.bitcoin_network() {
-        bail!("--funding-wif does not match {}", args.network.as_str());
+    doge_network
+        .validate_wif(&funding_wif)
+        .context("validate funding WIF network")?;
+    let funding_key = PrivateKey::from_wif(&funding_wif).context("parse funding WIF")?;
+    if funding_key.network != doge_network.bitcoin_network() {
+        bail!("funding WIF does not match {}", doge_network.as_str());
     }
     let secp = Secp256k1::new();
     let funding_public_key = funding_key.public_key(&secp);
-    let funding_address = Address::p2pkh(&funding_public_key, args.network.bitcoin_network());
+    let funding_address = Address::p2pkh(&funding_public_key, doge_network.bitcoin_network());
     let funding_script = funding_address.script_pubkey();
     let deposit_script = ScriptBuf::new_p2sh(&ScriptHash::from_byte_array(script_hash));
     let rust_dogecoin_deposit_address =
-        Address::from_script(&deposit_script, args.network.bitcoin_network())
+        Address::from_script(&deposit_script, doge_network.bitcoin_network())
             .context("derive rust-dogecoin P2SH address")?;
     if rust_dogecoin_deposit_address.to_string() != deposit_address {
         bail!(
@@ -288,13 +312,14 @@ async fn run(args: Args) -> Result<()> {
     }
 
     let http = HttpClient::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()
         .context("build Electrs HTTP client")?;
     verify_funding_utxo(
         &http,
-        args.network,
-        &args.electrs_url,
+        doge_network,
+        &electrs_url,
         &funding_address.to_string(),
         args.funding_txid,
         args.funding_vout,
@@ -315,7 +340,7 @@ async fn run(args: Args) -> Result<()> {
     )?;
     let local_txid = deposit_tx.txid();
     let raw_tx_hex = serialize_hex(&deposit_tx);
-    let broadcast_txid = broadcast_electrs(&http, &args.electrs_url, &raw_tx_hex).await?;
+    let broadcast_txid = broadcast_electrs(&http, &electrs_url, &raw_tx_hex).await?;
     if broadcast_txid != local_txid {
         bail!("Electrs returned txid {broadcast_txid}, but rust-dogecoin constructed {local_txid}");
     }
@@ -325,8 +350,8 @@ async fn run(args: Args) -> Result<()> {
             schema: "doge-custody-deposit-evidence-v2",
             completed: false,
             deposit: json!({
-                "network": args.network.as_str(),
-                "electrs_url": args.electrs_url,
+                "network": doge_network.as_str(),
+                "electrs_url": electrs_url,
                 "funding_address": funding_address.to_string(),
                 "funding_txid": args.funding_txid.to_string(),
                 "funding_vout": args.funding_vout,
@@ -353,7 +378,7 @@ async fn run(args: Args) -> Result<()> {
 
     let confirmed = poll_deposit(
         &http,
-        &args.electrs_url,
+        &electrs_url,
         local_txid,
         Duration::from_secs(args.confirmation_timeout_secs),
         Duration::from_millis(args.poll_interval_ms),
@@ -404,7 +429,7 @@ async fn run(args: Args) -> Result<()> {
         &http,
         format!(
             "{}/block/{block_hash_text}/txids",
-            args.electrs_url.trim_end_matches('/')
+            electrs_url.trim_end_matches('/')
         ),
     )
     .await?;
@@ -416,7 +441,7 @@ async fn run(args: Args) -> Result<()> {
         })?;
     let tx_index =
         u16::try_from(tx_index).context("deposit block transaction index exceeds u16")?;
-    let tip_height = electrs_get_height(&http, &args.electrs_url).await?;
+    let tip_height = electrs_get_height(&http, &electrs_url).await?;
     let confirmations = tip_height
         .checked_sub(block_height)
         .and_then(|depth| depth.checked_add(1))
@@ -455,8 +480,8 @@ async fn run(args: Args) -> Result<()> {
         schema: "doge-custody-deposit-evidence-v2",
         completed: true,
         deposit: json!({
-            "network": args.network.as_str(),
-            "electrs_url": args.electrs_url,
+            "network": doge_network.as_str(),
+            "electrs_url": electrs_url,
             "funding_address": funding_address.to_string(),
             "funding_txid": args.funding_txid.to_string(),
             "funding_vout": args.funding_vout,
@@ -557,37 +582,46 @@ fn build_signed_deposit_transaction(
 
 async fn verify_funding_utxo(
     client: &HttpClient,
-    network: NetworkProfile,
+    network: DogeNetwork,
     electrs_url: &str,
     funding_address: &str,
     funding_txid: Txid,
     funding_vout: u32,
     funding_amount: u64,
 ) -> Result<()> {
-    Address::from_str(funding_address)
+    let funding_address = Address::from_str(funding_address)
         .context("parse funding address for Electrs lookup")?
         .require_network(network.bitcoin_network())
         .with_context(|| format!("funding address is not {}", network.as_str()))?;
-    let url = format!(
-        "{}/address/{funding_address}/utxo",
-        electrs_url.trim_end_matches('/'),
-    );
-    let utxos: Vec<ElectrsUtxo> = electrs_get_json(client, url).await?;
-    let utxo = utxos
-        .iter()
-        .find(|utxo| utxo.txid == funding_txid && utxo.vout == funding_vout)
-        .ok_or_else(|| {
-            anyhow!(
-                "funding outpoint {funding_txid}:{funding_vout} is not unspent at address {funding_address}"
-            )
-        })?;
-    if utxo.value != funding_amount {
+    // Query by txid instead of `/address/{base58}/utxo`. Some Dogecoin Electrs
+    // deployments index Dogecoin correctly but retain Bitcoin-only REST address
+    // parsing, which rejects valid Dogecoin testnet/regtest Base58 prefixes.
+    // The transaction endpoint is network-agnostic; verify the exact vout,
+    // amount, scriptPubKey, and confirmation locally.
+    let url = format!("{}/tx/{funding_txid}", electrs_url.trim_end_matches('/'));
+    let transaction: ElectrsTx = electrs_get_json(client, url).await?;
+    if transaction.txid != funding_txid {
         bail!(
-            "--funding-amount is {funding_amount} sats, but Electrs reports {} sats",
-            utxo.value
+            "Electrs returned transaction {}, expected {funding_txid}",
+            transaction.txid
         );
     }
-    if !utxo.status.confirmed {
+    let output = transaction
+        .vout
+        .get(funding_vout as usize)
+        .ok_or_else(|| anyhow!("funding transaction {funding_txid} has no vout {funding_vout}"))?;
+    if output.value != funding_amount {
+        bail!(
+            "--funding-amount is {funding_amount} sats, but Electrs reports {} sats",
+            output.value
+        );
+    }
+    if output.scriptpubkey != hex::encode(funding_address.script_pubkey().as_bytes()) {
+        bail!(
+            "funding outpoint {funding_txid}:{funding_vout} does not pay the supplied funding address"
+        );
+    }
+    if !transaction.status.confirmed {
         bail!("funding outpoint {funding_txid}:{funding_vout} is not confirmed");
     }
     Ok(())
@@ -681,11 +715,12 @@ async fn electrs_get_json<T: DeserializeOwned>(client: &HttpClient, url: String)
 }
 
 fn p2sh_custody_address(
-    network: NetworkProfile,
+    network: DogeNetwork,
     bridge_state_pda: &Pubkey,
     recipient_token_account: &Pubkey,
+    manager_set_index: u32,
 ) -> Result<(String, [u8; 20])> {
-    let manager_set = local_regtest_manager_set();
+    let manager_set = manager_set_for_index(manager_set_index)?;
     let redeem_script = build_redeem_script(
         1,
         &bridge_state_pda.to_bytes(),
@@ -725,7 +760,7 @@ fn write_evidence(path: &Path, evidence: &Evidence) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn wif(profile: NetworkProfile, secret: u8) -> String {
+    fn wif(profile: DogeNetwork, secret: u8) -> String {
         let mut payload = vec![profile.wif_version()];
         payload.extend_from_slice(&[secret; 32]);
         payload.push(1);
@@ -734,26 +769,26 @@ mod tests {
 
     #[test]
     fn network_profiles_validate_dogecoin_wif_versions() {
-        let regtest = wif(NetworkProfile::Regtest, 1);
-        let testnet = wif(NetworkProfile::Testnet, 2);
-        assert!(NetworkProfile::Regtest.validate_wif(&regtest).is_ok());
-        assert!(NetworkProfile::Testnet.validate_wif(&regtest).is_err());
-        assert!(NetworkProfile::Testnet.validate_wif(&testnet).is_ok());
-        assert!(NetworkProfile::Regtest.validate_wif(&testnet).is_err());
+        let regtest = wif(DogeNetwork::Regtest, 1);
+        let testnet = wif(DogeNetwork::Testnet, 2);
+        assert!(DogeNetwork::Regtest.validate_wif(&regtest).is_ok());
+        assert!(DogeNetwork::Testnet.validate_wif(&regtest).is_err());
+        assert!(DogeNetwork::Testnet.validate_wif(&testnet).is_ok());
+        assert!(DogeNetwork::Regtest.validate_wif(&testnet).is_err());
     }
 
     #[test]
     fn network_profiles_encode_dogecoin_addresses() {
         let payload = [0x11; 20];
         assert_ne!(
-            NetworkProfile::Regtest.encode_address(0, payload).unwrap(),
-            NetworkProfile::Testnet.encode_address(0, payload).unwrap(),
+            DogeNetwork::Regtest.encode_address(0, payload).unwrap(),
+            DogeNetwork::Testnet.encode_address(0, payload).unwrap(),
         );
         assert_eq!(
-            NetworkProfile::Regtest.encode_address(1, payload).unwrap(),
-            NetworkProfile::Testnet.encode_address(1, payload).unwrap(),
+            DogeNetwork::Regtest.encode_address(1, payload).unwrap(),
+            DogeNetwork::Testnet.encode_address(1, payload).unwrap(),
         );
-        assert_eq!(NetworkProfile::Testnet.p2pkh_version(), 0x71);
-        assert_eq!(NetworkProfile::Testnet.wif_version(), 0xf1);
+        assert_eq!(DogeNetwork::Testnet.p2pkh_version(), 0x71);
+        assert_eq!(DogeNetwork::Testnet.wif_version(), 0xf1);
     }
 }

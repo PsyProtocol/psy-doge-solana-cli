@@ -9,10 +9,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use doge_local_ops::wormhole::{
+use crate::wormhole::{
     manager::{fetch_manager_signatures, local_regtest_manager_set},
     redeem::build_redeem_script,
-    utx0::{Utx0Input, Utx0Output, Utx0UnlockPayload, UtxoAddressType},
+    utx0::{Utx0Output, Utx0UnlockPayload, UtxoAddressType},
 };
 
 #[derive(Debug, Parser)]
@@ -20,7 +20,7 @@ use doge_local_ops::wormhole::{
     name = "wormhole-e2e",
     about = "Wormhole UTX0 + redeem script end-to-end smoke test"
 )]
-struct Args {
+pub struct Args {
     /// Emitter hex (32 bytes) used for the redeem script + optional API probe.
     #[arg(
         long,
@@ -38,10 +38,7 @@ struct Args {
     manager_api: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-
+pub async fn run(args: Args) -> Result<()> {
     let emitter = hex::decode(&args.emitter_hex)
         .with_context(|| format!("decode emitter hex {}", args.emitter_hex))?;
     let emitter: [u8; 32] = emitter
@@ -49,36 +46,20 @@ async fn main() -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("emitter must be 32 bytes"))?;
 
-    // ── Build a sample UTX0 unlock payload ──
+    let recipient_commitment = [0xab; 32];
     let recipient = {
-        let mut r = [0u8; 32];
-        hex::decode_to_slice(
-            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-            &mut r,
-        )?;
-        r
-    };
-    let txid = {
-        let mut t = [0u8; 32];
-        hex::decode_to_slice(
-            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-            &mut t,
-        )?;
-        t
+        let mut address = [0u8; 20];
+        hex::decode_to_slice("55ae51684c43435da751ac8d2173b2652eb64105", &mut address)?;
+        address
     };
 
     let payload = Utx0UnlockPayload {
-        destination_chain: doge_local_ops::wormhole::chain_id::DOGECOIN,
+        destination_chain: crate::wormhole::chain_id::DOGECOIN,
         delegated_manager_set_index: 0,
-        inputs: vec![Utx0Input {
-            original_recipient_address: recipient,
-            transaction_id: txid,
-            vout: 0,
-        }],
         outputs: vec![Utx0Output {
             amount: 1_000_000,
             address_type: UtxoAddressType::P2pkh,
-            address: hex::decode("55ae51684c43435da751ac8d2173b2652eb64105")?,
+            address: recipient,
         }],
     };
 
@@ -91,7 +72,7 @@ async fn main() -> Result<()> {
 
     // ── Redeem script with the deterministic local-regtest 5/7 manager set ──
     let ms = local_regtest_manager_set();
-    let redeem = build_redeem_script(args.emitter_chain, &emitter, &recipient, ms.m, &ms.pubkeys)?;
+    let redeem = build_redeem_script(args.emitter_chain, &emitter, &recipient_commitment, ms.m, &ms.pubkeys)?;
     println!(
         "redeem script (m={}, n={}, {} bytes): {}",
         ms.m,

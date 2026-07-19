@@ -1,0 +1,25 @@
+{
+  "name": "psy-doge-solana-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dogecoin ↔ Solana bridge CLI and local Bun orchestration",
+  "scripts": {
+    "local": "bun tools/local/launcher.ts --network localhost",
+    "local:preflight": "bun tools/local/launcher.ts --network localhost --preflight --no-build",
+    "deploy:devnet": "bun tools/deploy/devnet.ts --network devnet",
+    "start:devnet": "bun tools/devnet/start.ts --network devnet"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "@solana/spl-token": "^0.4.13",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}

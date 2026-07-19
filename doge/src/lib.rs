@@ -1,3 +1,5 @@
+pub mod commands;
+pub mod network;
 pub mod custody_ops;
 pub mod wormhole;
 

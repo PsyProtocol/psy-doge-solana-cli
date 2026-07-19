@@ -1,4 +1,23 @@
 /target/
 doge/target/
+cli/target/
+node_modules/
+.bun/
+dist/
 *.sqlite3
 *.bin
+
+# Generated local validation/deployment output
+deployments/
+evidence.json
+funding.json
+funding.wif
+deposit-evidence.json
+withdrawal-evidence.json
+block-proof-evidence/
+*-evidence.json
+**/local-smoke-evidence.json
+**/local-smoke-deposit-evidence.json
+**/local-smoke-withdrawal-evidence.json
+**/local-smoke-funding.json
+**/psy-doge-block-proof-evidence/

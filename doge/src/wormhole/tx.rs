@@ -1,97 +1,77 @@
-//! Legacy (pre-segwit) Dogecoin transaction builder, sighash, scriptSig and
-//! broadcast serialization for the Wormhole UTXO relay.
+//! Dogecoin transaction construction for outputs-only UTX0 withdrawals.
 //!
-//! Mirrors `wormhole/node/pkg/manager/dogecoin/transaction.go`:
-//!   * `BuildUnsignedTransaction`  -> [`UnsignedTransaction::from_utx0`]
-//!   * `ComputeSighash`            -> [`UnsignedTransaction::sighash_all`]
-//!   * `ApplySignatureToInput`     -> [`UnsignedTransaction::apply_script_sig`]
-//!   * `SerializeForBroadcast`     -> [`UnsignedTransaction::serialize`]
-//!   * `TxHash`                    -> [`UnsignedTransaction::txid`]
-//!
-//! Wire format (Bitcoin/Dogecoin consensus, little-endian):
-//!   version(u32 LE) + varint(in_count) + tx_in[] + varint(out_count)
-//!   + tx_out[] + locktime(u32 LE)
-//! TxIn:  prev_txid(32 LE) + vout(u32 LE) + varint(script_len) + script
-//!        + sequence(u32 LE)
-//! TxOut: value(u64 LE) + varint(script_len) + script
-//!
-//! The transaction version is `1` (btcd `wire.TxVersion`) and the input
-//! sequence is `0xffffffff`, matching the Go manager service.
+//! The operator selects custody UTXOs, then constructs the exact unsigned
+//! transaction sent to the Manager service for input signing.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use super::utx0::{Utx0UnlockPayload, UtxoAddressType};
+use super::utx0::UtxoAddressType;
 
-/// SIGHASH_ALL (0x01) — the only hash type used by the manager service.
 pub const SIGHASH_ALL: u32 = 0x01;
-
-/// Bitcoin wire transaction version used by the Wormhole manager service
-/// (`wire.TxVersion`).
 pub const TX_VERSION: u32 = 1;
-/// Default input sequence (`wire.MaxTxInSequenceNum`).
 pub const SEQUENCE_FINAL: u32 = 0xffff_ffff;
+const MAX_PERSISTED_INPUTS: usize = 1_000;
+const MAX_PERSISTED_OUTPUTS: usize = 320;
+const MAX_STANDARD_OUTPUT_SCRIPT_LEN: usize = 25;
 
-/// Build a canonical P2PKH scriptPubKey:
-/// `OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedUtxo {
+    /// Dogecoin display-order transaction ID. It is reversed for wire encoding.
+    pub transaction_id: [u8; 32],
+    pub vout: u32,
+    pub redeem_script: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionOutput {
+    pub amount: u64,
+    pub address_type: UtxoAddressType,
+    pub address: [u8; 20],
+}
+
 pub fn p2pkh_script_pubkey(pubkey_hash: &[u8; 20]) -> Vec<u8> {
-    let mut s = Vec::with_capacity(25);
-    s.push(0x76); // OP_DUP
-    s.push(0xa9); // OP_HASH160
-    s.push(0x14); // push 20 bytes
-    s.extend_from_slice(pubkey_hash);
-    s.push(0x88); // OP_EQUALVERIFY
-    s.push(0xac); // OP_CHECKSIG
-    s
+    let mut script = Vec::with_capacity(25);
+    script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+    script.extend_from_slice(pubkey_hash);
+    script.extend_from_slice(&[0x88, 0xac]);
+    script
 }
 
-/// Build a canonical P2SH scriptPubKey: `OP_HASH160 <20> OP_EQUAL`.
 pub fn p2sh_script_pubkey(script_hash: &[u8; 20]) -> Vec<u8> {
-    let mut s = Vec::with_capacity(23);
-    s.push(0xa9); // OP_HASH160
-    s.push(0x14); // push 20 bytes
-    s.extend_from_slice(script_hash);
-    s.push(0x87); // OP_EQUAL
-    s
+    let mut script = Vec::with_capacity(23);
+    script.extend_from_slice(&[0xa9, 0x14]);
+    script.extend_from_slice(script_hash);
+    script.push(0x87);
+    script
 }
 
-/// Build the scriptPubKey for a UTXO output address type.
-pub fn script_pub_key_for(addr_type: UtxoAddressType, address: &[u8]) -> Result<Vec<u8>> {
-    match addr_type {
-        UtxoAddressType::P2pkh => {
-            let h: [u8; 20] = address
-                .try_into()
-                .map_err(|_| anyhow!("P2PKH address must be 20 bytes"))?;
-            Ok(p2pkh_script_pubkey(&h))
-        }
-        UtxoAddressType::P2sh => {
-            let h: [u8; 20] = address
-                .try_into()
-                .map_err(|_| anyhow!("P2SH address must be 20 bytes"))?;
-            Ok(p2sh_script_pubkey(&h))
-        }
+pub fn script_pub_key_for(address_type: UtxoAddressType, address: &[u8; 20]) -> Vec<u8> {
+    match address_type {
+        UtxoAddressType::P2pkh => p2pkh_script_pubkey(address),
+        UtxoAddressType::P2sh => p2sh_script_pubkey(address),
     }
 }
 
 #[inline]
-fn write_varint(buf: &mut Vec<u8>, n: u64) {
-    if n < 0xfd {
-        buf.push(n as u8);
-    } else if n <= 0xffff {
-        buf.push(0xfd);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if n <= 0xffff_ffff {
-        buf.push(0xfe);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
+fn write_varint(bytes: &mut Vec<u8>, value: u64) {
+    if value < 0xfd {
+        bytes.push(value as u8);
+    } else if value <= 0xffff {
+        bytes.push(0xfd);
+        bytes.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value <= 0xffff_ffff {
+        bytes.push(0xfe);
+        bytes.extend_from_slice(&(value as u32).to_le_bytes());
     } else {
-        buf.push(0xff);
-        buf.extend_from_slice(&n.to_le_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
 }
 
 #[derive(Debug, Clone)]
 struct TxIn {
-    prev_txid_le: [u8; 32], // internal little-endian (wire order)
+    prev_txid_le: [u8; 32],
     vout: u32,
     script_sig: Vec<u8>,
     sequence: u32,
@@ -103,70 +83,52 @@ struct TxOut {
     script_pubkey: Vec<u8>,
 }
 
-/// An unsigned (and later signed) Dogecoin transaction carrying the redeem
-/// script used for each P2SH input.
 #[derive(Debug, Clone)]
 pub struct UnsignedTransaction {
     version: u32,
     inputs: Vec<TxIn>,
     outputs: Vec<TxOut>,
+    logical_outputs: Vec<TransactionOutput>,
     locktime: u32,
-    /// Per-input redeem script (the subscript signed for P2SH).
     redeem_scripts: Vec<Vec<u8>>,
 }
 
 impl UnsignedTransaction {
-    /// Build the unsigned transaction from a `UTX0` unlock payload.
-    ///
-    /// `redeem_scripts` must contain one redeem script per input (in the
-    /// Wormhole flow each input has its own recipient, hence its own redeem
-    /// script). The Wormhole `transaction_id` is big-endian and is reversed
-    /// to the Bitcoin internal little-endian prevout hash, exactly as the Go
-    /// `BuildUnsignedTransaction` does.
-    pub fn from_utx0(payload: &Utx0UnlockPayload, redeem_scripts: Vec<Vec<u8>>) -> Result<Self> {
-        if payload.inputs.is_empty() {
-            bail!("no inputs in payload");
+    pub fn new(inputs: Vec<SelectedUtxo>, outputs: Vec<TransactionOutput>) -> Result<Self> {
+        if inputs.is_empty() {
+            bail!("no selected inputs");
         }
-        if payload.outputs.is_empty() {
-            bail!("no outputs in payload");
-        }
-        if redeem_scripts.len() != payload.inputs.len() {
-            bail!(
-                "redeem_scripts count {} != inputs count {}",
-                redeem_scripts.len(),
-                payload.inputs.len()
-            );
+        if outputs.is_empty() {
+            bail!("no outputs");
         }
 
-        let mut inputs = Vec::with_capacity(payload.inputs.len());
-        for input in &payload.inputs {
-            // Reverse big-endian Wormhole txid -> Bitcoin little-endian prevout.
-            let mut prev_txid_le = [0u8; 32];
-            for i in 0..32 {
-                prev_txid_le[i] = input.transaction_id[31 - i];
-            }
-            inputs.push(TxIn {
+        let mut tx_inputs = Vec::with_capacity(inputs.len());
+        let mut redeem_scripts = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let mut prev_txid_le = input.transaction_id;
+            prev_txid_le.reverse();
+            tx_inputs.push(TxIn {
                 prev_txid_le,
                 vout: input.vout,
                 script_sig: Vec::new(),
                 sequence: SEQUENCE_FINAL,
             });
+            redeem_scripts.push(input.redeem_script);
         }
 
-        let mut outputs = Vec::with_capacity(payload.outputs.len());
-        for (i, output) in payload.outputs.iter().enumerate() {
-            let script_pubkey = script_pub_key_for(output.address_type, &output.address)
-                .map_err(|e| anyhow!("output {i}: {e}"))?;
-            outputs.push(TxOut {
+        let tx_outputs = outputs
+            .iter()
+            .map(|output| TxOut {
                 value: output.amount,
-                script_pubkey,
-            });
-        }
+                script_pubkey: script_pub_key_for(output.address_type, &output.address),
+            })
+            .collect();
 
-        Ok(UnsignedTransaction {
+        Ok(Self {
             version: TX_VERSION,
-            inputs,
-            outputs,
+            inputs: tx_inputs,
+            outputs: tx_outputs,
+            logical_outputs: outputs,
             locktime: 0,
             redeem_scripts,
         })
@@ -180,20 +142,14 @@ impl UnsignedTransaction {
         self.outputs.len()
     }
 
-    /// Compute the legacy SIGHASH_ALL sighash for `input_index`, using the
-    /// input's redeem script as the signed subscript (P2SH semantics).
-    ///
-    /// This reproduces btcd `CalcSignatureHash(script, SigHashAll, tx, idx)`:
-    /// copy the tx, blank every input's scriptSig, set the signed input's
-    /// scriptSig to the redeem script, serialize (no witness), append the
-    /// hash type as a little-endian u32, then double-SHA256.
+    pub fn outputs(&self) -> &[TransactionOutput] {
+        &self.logical_outputs
+    }
+
     pub fn sighash_all(&self, input_index: usize) -> Result<[u8; 32]> {
         self.sighash(input_index, SIGHASH_ALL)
     }
 
-    /// Legacy sighash for the given (base) hash type. Only `SIGHASH_ALL` is
-    /// used by the relay, but `SIGHASH_NONE`/`SINGLE`/`ANYONECANPAY` are
-    /// handled for fidelity with btcd's `calcSignatureHash`.
     pub fn sighash(&self, input_index: usize, hash_type: u32) -> Result<[u8; 32]> {
         if input_index >= self.inputs.len() {
             bail!(
@@ -205,328 +161,413 @@ impl UnsignedTransaction {
             .redeem_scripts
             .get(input_index)
             .ok_or_else(|| anyhow!("no redeem script for input {input_index}"))?;
-
         let base = hash_type & 0x1f;
         let anyone_can_pay = (hash_type & 0x80) != 0;
 
-        // SIGHASH_SINGLE with idx >= output count => hash of "01" (btcd rule).
         if base == 0x03 && input_index >= self.outputs.len() {
-            let preimage = [0x01u8];
-            return Ok(double_sha256(&preimage));
+            return Ok(double_sha256(&[0x01]));
         }
 
-        // Build the modified copy.
-        let mut inputs: Vec<TxIn> = if anyone_can_pay {
+        let mut inputs = if anyone_can_pay {
             vec![self.inputs[input_index].clone()]
         } else {
             self.inputs
                 .iter()
-                .map(|i| TxIn {
+                .map(|input| TxIn {
                     script_sig: Vec::new(),
-                    sequence: i.sequence,
-                    ..i.clone()
+                    ..input.clone()
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
-
-        // Set the signed input's scriptSig to the redeem script.
-        let signed_idx = if anyone_can_pay { 0 } else { input_index };
-        inputs[signed_idx].script_sig = redeem_script.clone();
-
-        // For NONE/SINGLE, blank other inputs' sequences.
+        let signed_index = if anyone_can_pay { 0 } else { input_index };
+        inputs[signed_index].script_sig = redeem_script.clone();
         if !anyone_can_pay && (base == 0x02 || base == 0x03) {
-            for (i, inp) in inputs.iter_mut().enumerate() {
-                if i != signed_idx {
-                    inp.sequence = 0;
+            for (index, input) in inputs.iter_mut().enumerate() {
+                if index != signed_index {
+                    input.sequence = 0;
                 }
             }
         }
 
-        // For NONE, drop all outputs; for SINGLE, keep only the matching output.
-        let outputs: Vec<TxOut> = match base {
+        let outputs = match base {
             0x02 => Vec::new(),
             0x03 => self.outputs.get(input_index).cloned().into_iter().collect(),
             _ => self.outputs.clone(),
         };
-
-        let mut buf = Vec::with_capacity(256);
-        buf.extend_from_slice(&self.version.to_le_bytes());
-        write_varint(&mut buf, inputs.len() as u64);
-        for inp in &inputs {
-            buf.extend_from_slice(&inp.prev_txid_le);
-            buf.extend_from_slice(&inp.vout.to_le_bytes());
-            write_varint(&mut buf, inp.script_sig.len() as u64);
-            buf.extend_from_slice(&inp.script_sig);
-            buf.extend_from_slice(&inp.sequence.to_le_bytes());
-        }
-        write_varint(&mut buf, outputs.len() as u64);
-        for out in &outputs {
-            buf.extend_from_slice(&out.value.to_le_bytes());
-            write_varint(&mut buf, out.script_pubkey.len() as u64);
-            buf.extend_from_slice(&out.script_pubkey);
-        }
-        buf.extend_from_slice(&self.locktime.to_le_bytes());
-        // Append hash type (little-endian u32) — legacy sighash convention.
-        buf.extend_from_slice(&hash_type.to_le_bytes());
-
-        Ok(double_sha256(&buf))
+        let mut bytes = serialize_transaction(self.version, &inputs, &outputs, self.locktime);
+        bytes.extend_from_slice(&hash_type.to_le_bytes());
+        Ok(double_sha256(&bytes))
     }
 
-    /// Apply the M aggregated signatures to `input_index`, producing the
-    /// P2SH multisig scriptSig: `OP_0 <sig_1> ... <sig_M> <redeemScript>`.
-    ///
-    /// `signatures` must be ordered to match the redeem-script pubkey order
-    /// and each must already be DER-encoded with the sighash type byte
-    /// appended (as the manager service produces them).
     pub fn apply_script_sig(&mut self, input_index: usize, signatures: &[Vec<u8>]) -> Result<()> {
-        if input_index >= self.inputs.len() {
-            bail!("input index {input_index} out of range");
-        }
+        let input = self
+            .inputs
+            .get_mut(input_index)
+            .ok_or_else(|| anyhow!("input index {input_index} out of range"))?;
         let redeem_script = self
             .redeem_scripts
             .get(input_index)
             .ok_or_else(|| anyhow!("no redeem script for input {input_index}"))?;
-
         let mut script_sig =
-            Vec::with_capacity(1 + signatures.len() * 74 + 1 + redeem_script.len());
-        script_sig.push(0x00); // OP_0 — CHECKMULTISIG off-by-one dummy
-        for sig in signatures {
-            push_data_inline(&mut script_sig, sig);
+            Vec::with_capacity(1 + signatures.len() * 74 + redeem_script.len() + 2);
+        script_sig.push(0x00);
+        for signature in signatures {
+            push_data_inline(&mut script_sig, signature);
         }
         push_data_inline(&mut script_sig, redeem_script);
-        self.inputs[input_index].script_sig = script_sig;
+        input.script_sig = script_sig;
         Ok(())
     }
+    /// Recover an unsigned transaction from durable wire bytes and independently
+    /// reconstructed selected inputs. Redeem scripts come from `inputs`, so
+    /// sighash construction remains available after restart without persisting
+    /// private key material.
+    pub fn from_persisted_bytes(bytes: &[u8], inputs: Vec<SelectedUtxo>) -> Result<Self> {
+        if inputs.is_empty() {
+            bail!("no selected inputs");
+        }
+        let mut reader = TransactionReader::new(bytes);
+        let version = reader.read_u32("version")?;
+        if version != TX_VERSION {
+            bail!("unsupported persisted transaction version {version}");
+        }
+        let input_count = reader.read_count("input count")?;
+        if input_count > MAX_PERSISTED_INPUTS {
+            bail!("persisted transaction input count {input_count} exceeds safety limit");
+        }
+        if input_count != inputs.len() {
+            bail!(
+                "persisted transaction has {input_count} inputs, reservation has {}",
+                inputs.len()
+            );
+        }
 
-    /// Serialize the (signed) transaction for broadcast.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + self.inputs.len() * 40 + self.outputs.len() * 34);
-        buf.extend_from_slice(&self.version.to_le_bytes());
-        write_varint(&mut buf, self.inputs.len() as u64);
-        for inp in &self.inputs {
-            buf.extend_from_slice(&inp.prev_txid_le);
-            buf.extend_from_slice(&inp.vout.to_le_bytes());
-            write_varint(&mut buf, inp.script_sig.len() as u64);
-            buf.extend_from_slice(&inp.script_sig);
-            buf.extend_from_slice(&inp.sequence.to_le_bytes());
+        let mut tx_inputs = Vec::with_capacity(input_count);
+        let mut redeem_scripts = Vec::with_capacity(input_count);
+        for (index, selected) in inputs.into_iter().enumerate() {
+            let prev_txid_le: [u8; 32] = reader
+                .read_exact(32, "input transaction id")?
+                .try_into()
+                .expect("exact transaction id length");
+            let vout = reader.read_u32("input vout")?;
+            let script_len = reader.read_count("input script length")?;
+            if script_len != 0 {
+                bail!("persisted unsigned input {index} contains a scriptSig");
+            }
+            let sequence = reader.read_u32("input sequence")?;
+            if sequence != SEQUENCE_FINAL {
+                bail!("persisted unsigned input {index} has non-final sequence");
+            }
+            let mut expected_prev_txid_le = selected.transaction_id;
+            expected_prev_txid_le.reverse();
+            if prev_txid_le != expected_prev_txid_le || vout != selected.vout {
+                bail!("persisted unsigned input {index} differs from custody reservation");
+            }
+            tx_inputs.push(TxIn {
+                prev_txid_le,
+                vout,
+                script_sig: Vec::new(),
+                sequence,
+            });
+            redeem_scripts.push(selected.redeem_script);
         }
-        write_varint(&mut buf, self.outputs.len() as u64);
-        for out in &self.outputs {
-            buf.extend_from_slice(&out.value.to_le_bytes());
-            write_varint(&mut buf, out.script_pubkey.len() as u64);
-            buf.extend_from_slice(&out.script_pubkey);
+
+        let output_count = reader.read_count("output count")?;
+        if output_count > MAX_PERSISTED_OUTPUTS {
+            bail!("persisted transaction output count {output_count} exceeds safety limit");
         }
-        buf.extend_from_slice(&self.locktime.to_le_bytes());
-        buf
+        if output_count == 0 {
+            bail!("persisted unsigned transaction has no outputs");
+        }
+        let mut outputs = Vec::with_capacity(output_count);
+        let mut logical_outputs = Vec::with_capacity(output_count);
+        for index in 0..output_count {
+            let value = reader.read_u64("output value")?;
+            let script_len = reader.read_count("output script length")?;
+            if script_len > MAX_STANDARD_OUTPUT_SCRIPT_LEN {
+                bail!("persisted output {index} scriptPubKey exceeds safety limit");
+            }
+            let script_pubkey = reader
+                .read_exact(script_len, "output scriptPubKey")?
+                .to_vec();
+            let (address_type, address) = parse_standard_output(&script_pubkey)
+                .with_context(|| format!("decode persisted output {index}"))?;
+            outputs.push(TxOut {
+                value,
+                script_pubkey,
+            });
+            logical_outputs.push(TransactionOutput {
+                amount: value,
+                address_type,
+                address,
+            });
+        }
+        let locktime = reader.read_u32("locktime")?;
+        if locktime != 0 {
+            bail!("persisted unsigned transaction has nonzero locktime");
+        }
+        reader.finish()?;
+
+        let transaction = Self {
+            version,
+            inputs: tx_inputs,
+            outputs,
+            logical_outputs,
+            locktime,
+            redeem_scripts,
+        };
+        if transaction.serialize() != bytes {
+            bail!("persisted unsigned transaction is not canonically encoded");
+        }
+        Ok(transaction)
     }
 
-    /// Standard txid: double-SHA256 of the serialized tx, reversed to
-    /// big-endian display order.
+    pub fn serialize(&self) -> Vec<u8> {
+        serialize_transaction(self.version, &self.inputs, &self.outputs, self.locktime)
+    }
+
     pub fn txid(&self) -> [u8; 32] {
-        let mut h = double_sha256(&self.serialize());
-        h.reverse();
-        h
+        let mut txid = double_sha256(&self.serialize());
+        txid.reverse();
+        txid
     }
 }
 
-#[inline]
-fn push_data_inline(buf: &mut Vec<u8>, data: &[u8]) {
+fn parse_standard_output(script: &[u8]) -> Result<(UtxoAddressType, [u8; 20])> {
+    let (address_type, payload) = if script.len() == 25
+        && script[..3] == [0x76, 0xa9, 0x14]
+        && script[23..] == [0x88, 0xac]
+    {
+        (UtxoAddressType::P2pkh, &script[3..23])
+    } else if script.len() == 23 && script[..2] == [0xa9, 0x14] && script[22] == 0x87 {
+        (UtxoAddressType::P2sh, &script[2..22])
+    } else {
+        bail!("unsupported output scriptPubKey")
+    };
+    let mut address = [0u8; 20];
+    address.copy_from_slice(payload);
+    Ok((address_type, address))
+}
+
+struct TransactionReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> TransactionReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_exact(&mut self, len: usize, field: &str) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("persisted transaction {field} length overflow"))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| anyhow!("persisted transaction is truncated at {field}"))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32> {
+        Ok(u32::from_le_bytes(
+            self.read_exact(4, field)?.try_into().expect("exact u32 length"),
+        ))
+    }
+
+    fn read_u64(&mut self, field: &str) -> Result<u64> {
+        Ok(u64::from_le_bytes(
+            self.read_exact(8, field)?.try_into().expect("exact u64 length"),
+        ))
+    }
+
+    fn read_count(&mut self, field: &str) -> Result<usize> {
+        let first = self.read_exact(1, field)?[0];
+        let value = match first {
+            0x00..=0xfc => u64::from(first),
+            0xfd => {
+                let value = u16::from_le_bytes(
+                    self.read_exact(2, field)?.try_into().expect("exact u16 length"),
+                );
+                if value < 0xfd {
+                    bail!("persisted transaction {field} uses a non-canonical varint");
+                }
+                u64::from(value)
+            }
+            0xfe => {
+                let value = self.read_u32(field)?;
+                if value <= u32::from(u16::MAX) {
+                    bail!("persisted transaction {field} uses a non-canonical varint");
+                }
+                u64::from(value)
+            }
+            0xff => {
+                let value = self.read_u64(field)?;
+                if value <= u64::from(u32::MAX) {
+                    bail!("persisted transaction {field} uses a non-canonical varint");
+                }
+                value
+            }
+        };
+        usize::try_from(value)
+            .map_err(|_| anyhow!("persisted transaction {field} exceeds platform limits"))
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.offset != self.bytes.len() {
+            bail!("persisted transaction has trailing bytes");
+        }
+        Ok(())
+    }
+}
+
+fn serialize_transaction(
+    version: u32,
+    inputs: &[TxIn],
+    outputs: &[TxOut],
+    locktime: u32,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + inputs.len() * 40 + outputs.len() * 34);
+    bytes.extend_from_slice(&version.to_le_bytes());
+    write_varint(&mut bytes, inputs.len() as u64);
+    for input in inputs {
+        bytes.extend_from_slice(&input.prev_txid_le);
+        bytes.extend_from_slice(&input.vout.to_le_bytes());
+        write_varint(&mut bytes, input.script_sig.len() as u64);
+        bytes.extend_from_slice(&input.script_sig);
+        bytes.extend_from_slice(&input.sequence.to_le_bytes());
+    }
+    write_varint(&mut bytes, outputs.len() as u64);
+    for output in outputs {
+        bytes.extend_from_slice(&output.value.to_le_bytes());
+        write_varint(&mut bytes, output.script_pubkey.len() as u64);
+        bytes.extend_from_slice(&output.script_pubkey);
+    }
+    bytes.extend_from_slice(&locktime.to_le_bytes());
+    bytes
+}
+
+fn push_data_inline(bytes: &mut Vec<u8>, data: &[u8]) {
     let len = data.len();
     if len <= 0x4b {
-        buf.push(len as u8);
+        bytes.push(len as u8);
     } else if len <= 0xff {
-        buf.push(0x4c);
-        buf.push(len as u8);
+        bytes.extend_from_slice(&[0x4c, len as u8]);
     } else if len <= 0xffff {
-        buf.push(0x4d);
-        buf.extend_from_slice(&(len as u16).to_le_bytes());
+        bytes.push(0x4d);
+        bytes.extend_from_slice(&(len as u16).to_le_bytes());
     } else {
-        buf.push(0x4e);
-        buf.extend_from_slice(&(len as u32).to_le_bytes());
+        bytes.push(0x4e);
+        bytes.extend_from_slice(&(len as u32).to_le_bytes());
     }
-    buf.extend_from_slice(data);
+    bytes.extend_from_slice(data);
 }
 
-/// Bitcoin double-SHA256.
 pub fn double_sha256(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
-    let second = Sha256::digest(first);
-    second.into()
+    Sha256::digest(first).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wormhole::utx0::{Utx0Input, Utx0Output, UtxoAddressType};
 
-    fn a32(s: &str) -> [u8; 32] {
-        let mut a = [0u8; 32];
-        hex::decode_to_slice(s, &mut a).unwrap();
-        a
+    fn selected(seed: u8, vout: u32) -> SelectedUtxo {
+        SelectedUtxo {
+            transaction_id: [seed; 32],
+            vout,
+            redeem_script: vec![0x51],
+        }
     }
 
-    fn dummy_pubkeys() -> [[u8; 33]; 2] {
-        let mut p1 = [0u8; 33];
-        p1[0] = 0x02;
-        let mut p2 = [0u8; 33];
-        p2[0] = 0x03;
-        [p1, p2]
-    }
-
-    fn sample_payload() -> Utx0UnlockPayload {
-        Utx0UnlockPayload {
-            destination_chain: 65,
-            delegated_manager_set_index: 1,
-            inputs: vec![Utx0Input {
-                original_recipient_address: a32(
-                    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-                ),
-                transaction_id: a32(
-                    "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-                ),
-                vout: 0,
-            }],
-            outputs: vec![Utx0Output {
-                amount: 1_000_000,
-                address_type: UtxoAddressType::P2pkh,
-                address: hex::decode("55ae51684c43435da751ac8d2173b2652eb64105").unwrap(),
-            }],
+    fn output(seed: u8) -> TransactionOutput {
+        TransactionOutput {
+            amount: 1_000_000,
+            address_type: UtxoAddressType::P2pkh,
+            address: [seed; 20],
         }
     }
 
     #[test]
-    fn build_unsigned_tx_structure() {
-        let payload = sample_payload();
-        let pks = dummy_pubkeys();
-        let r = crate::wormhole::redeem::build_redeem_script(1u16, &[0u8; 32], &[0u8; 32], 2, &pks)
-            .unwrap();
-        let tx = UnsignedTransaction::from_utx0(&payload, vec![r]).unwrap();
+    fn builds_after_operator_selects_inputs() {
+        let tx = UnsignedTransaction::new(vec![selected(0x22, 3)], vec![output(0x55)]).unwrap();
         assert_eq!(tx.input_count(), 1);
         assert_eq!(tx.output_count(), 1);
+        assert_eq!(tx.outputs(), &[output(0x55)]);
+        let bytes = tx.serialize();
+        assert_eq!(&bytes[0..4], &TX_VERSION.to_le_bytes());
+        assert_eq!(bytes[4], 1);
+        assert_eq!(&bytes[5..37], &[0x22; 32]);
+        assert_eq!(&bytes[37..41], &3u32.to_le_bytes());
+    }
 
-        let ser = tx.serialize();
-        // version = 1 (LE)
-        assert_eq!(&ser[0..4], &[1u8, 0, 0, 0]);
-        // input count = 1
-        assert_eq!(ser[4], 1);
-        // prevout hash is reversed txid
-        let mut reversed = [0u8; 32];
-        for i in 0..32 {
-            reversed[i] = payload.inputs[0].transaction_id[31 - i];
+    #[test]
+    fn selected_inputs_have_distinct_sighashes() {
+        let tx = UnsignedTransaction::new(
+            vec![selected(0x11, 0), selected(0x22, 1)],
+            vec![output(0x55)],
+        )
+        .unwrap();
+        assert_ne!(tx.sighash_all(0).unwrap(), tx.sighash_all(1).unwrap());
+    }
+
+    #[test]
+    fn rejects_missing_selected_inputs_or_outputs() {
+        assert!(UnsignedTransaction::new(Vec::new(), vec![output(0x55)]).is_err());
+        assert!(UnsignedTransaction::new(vec![selected(0x11, 0)], Vec::new()).is_err());
+    }
+
+    #[test]
+    fn applies_script_sig_and_computes_txid() {
+        let mut tx = UnsignedTransaction::new(vec![selected(0x11, 0)], vec![output(0x55)]).unwrap();
+        tx.apply_script_sig(0, &[vec![0x30, 0x01]]).unwrap();
+        let mut expected = double_sha256(&tx.serialize());
+        expected.reverse();
+        assert_eq!(tx.txid(), expected);
+    }
+    #[test]
+    fn recovers_prepare_style_persisted_transaction_with_sighash_material() {
+        let mut store_txid_a = [0u8; 32];
+        let mut store_txid_b = [0u8; 32];
+        for (index, byte) in store_txid_a.iter_mut().enumerate() {
+            *byte = index as u8;
         }
-        assert_eq!(&ser[5..37], &reversed);
-        // vout = 0 (LE)
-        assert_eq!(&ser[37..41], &[0u8; 4]);
-        // empty scriptSig length = 0
-        assert_eq!(ser[41], 0);
-        // sequence = 0xffffffff (LE)
-        assert_eq!(&ser[42..46], &[0xff, 0xff, 0xff, 0xff]);
+        for (index, byte) in store_txid_b.iter_mut().enumerate() {
+            *byte = (31 - index) as u8;
+        }
+        let inputs = [store_txid_a, store_txid_b]
+            .into_iter()
+            .enumerate()
+            .map(|(vout, mut transaction_id)| {
+                // Match `prepare_transaction`'s conversion from store txid order.
+                transaction_id.reverse();
+                SelectedUtxo {
+                    transaction_id,
+                    vout: vout as u32,
+                    redeem_script: vec![0x51, vout as u8],
+                }
+            })
+            .collect::<Vec<_>>();
+        let original = UnsignedTransaction::new(inputs.clone(), vec![output(0x55)]).unwrap();
+        let bytes = original.serialize();
+        assert_eq!(&bytes[5..37], &store_txid_a);
+        let recovered = UnsignedTransaction::from_persisted_bytes(&bytes, inputs).unwrap();
+        assert_eq!(recovered.serialize(), bytes);
+        assert_eq!(recovered.outputs(), original.outputs());
+        assert_eq!(recovered.sighash_all(0).unwrap(), original.sighash_all(0).unwrap());
+        assert_eq!(recovered.sighash_all(1).unwrap(), original.sighash_all(1).unwrap());
     }
 
     #[test]
-    fn sighash_all_is_nonzero_and_stable() {
-        let payload = sample_payload();
-        let pks = dummy_pubkeys();
-        let r = crate::wormhole::redeem::build_redeem_script(1u16, &[0u8; 32], &[0u8; 32], 2, &pks)
-            .unwrap();
-        let tx = UnsignedTransaction::from_utx0(&payload, vec![r]).unwrap();
-        let h0 = tx.sighash_all(0).unwrap();
-        assert!(h0.iter().any(|b| *b != 0));
-        assert_eq!(h0, tx.sighash_all(0).unwrap());
+    fn rejects_persisted_unsigned_transaction_drift() {
+        let inputs = vec![selected(0x11, 0)];
+        let original = UnsignedTransaction::new(inputs.clone(), vec![output(0x55)]).unwrap();
+        let mut bytes = original.serialize();
+        bytes[37] ^= 1;
+        assert!(UnsignedTransaction::from_persisted_bytes(&bytes, inputs).is_err());
     }
 
-    #[test]
-    fn sighash_out_of_range_errors() {
-        let payload = sample_payload();
-        let tx = UnsignedTransaction::from_utx0(&payload, vec![vec![0x51]]).unwrap();
-        assert!(tx.sighash_all(1).is_err());
-    }
-
-    #[test]
-    fn two_inputs_yield_different_sighashes() {
-        let payload = Utx0UnlockPayload {
-            destination_chain: 65,
-            delegated_manager_set_index: 1,
-            inputs: vec![
-                Utx0Input {
-                    original_recipient_address: [0u8; 32],
-                    transaction_id: a32(
-                        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-                    ),
-                    vout: 0,
-                },
-                Utx0Input {
-                    original_recipient_address: [0u8; 32],
-                    transaction_id: a32(
-                        "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
-                    ),
-                    vout: 1,
-                },
-            ],
-            outputs: vec![Utx0Output {
-                amount: 1_000_000,
-                address_type: UtxoAddressType::P2pkh,
-                address: hex::decode("55ae51684c43435da751ac8d2173b2652eb64105").unwrap(),
-            }],
-        };
-        let pks = dummy_pubkeys();
-        let r = crate::wormhole::redeem::build_redeem_script(1u16, &[0u8; 32], &[0u8; 32], 2, &pks)
-            .unwrap();
-        let tx = UnsignedTransaction::from_utx0(&payload, vec![r.clone(), r]).unwrap();
-        let h0 = tx.sighash_all(0).unwrap();
-        let h1 = tx.sighash_all(1).unwrap();
-        assert_ne!(h0, h1);
-    }
-
-    #[test]
-    fn apply_script_sig_shape() {
-        let payload = sample_payload();
-        let pks = dummy_pubkeys();
-        let r = crate::wormhole::redeem::build_redeem_script(1u16, &[0u8; 32], &[0u8; 32], 2, &pks)
-            .unwrap();
-        let redeem_len = r.len();
-        let mut tx = UnsignedTransaction::from_utx0(&payload, vec![r.clone()]).unwrap();
-        // two 8-byte DER+hashtype signatures
-        let sig1 = vec![0x30u8, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02, 0x01];
-        let sig2 = vec![0x30u8, 0x02, 0x01, 0x03, 0x02, 0x01, 0x04, 0x01];
-        tx.apply_script_sig(0, &[sig1, sig2]).unwrap();
-        let ser = tx.serialize();
-        // version(4) + in_count(1) + prevout(32) + vout(4) + script_len(varint)
-        let script_len_pos = 4 + 1 + 32 + 4;
-        // scriptSig = OP_0(1) + push(1+8) + push(1+8) + push(redeem via PUSHDATA1: 2+redeem_len)
-        let script_sig_len = 1 + 9 + 9 + (2 + redeem_len);
-        assert_eq!(ser[script_len_pos], script_sig_len as u8);
-        assert_eq!(ser[script_len_pos + 1], 0x00); // OP_0
-        assert_eq!(ser[script_len_pos + 2], 8); // first sig length
-                                                // tail: after scriptSig comes sequence(4) + out_count(1) + output(34)
-                                                // + locktime(4). The redeem push (OP_PUSHDATA1 + len + redeem) sits
-                                                // just before that trailing region.
-        let tail_start = ser.len() - 4 - 34 - 1 - 4 - 2 - redeem_len;
-        assert_eq!(ser[tail_start], 0x4c);
-        assert_eq!(ser[tail_start + 1], redeem_len as u8);
-        assert_eq!(&ser[tail_start + 2..tail_start + 2 + redeem_len], &r[..]);
-        assert_eq!(&ser[ser.len() - 4..], &[0u8; 4]); // locktime
-    }
-
-    #[test]
-    fn double_sha256_known_vector() {
-        // double_sha256(b"hello") == sha256(sha256(b"hello"))
-        let got = double_sha256(b"hello");
-        let first = Sha256::digest(b"hello");
-        let want: [u8; 32] = Sha256::digest(first).into();
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn txid_is_double_sha256_reversed() {
-        let payload = sample_payload();
-        let pks = dummy_pubkeys();
-        let r = crate::wormhole::redeem::build_redeem_script(1u16, &[0u8; 32], &[0u8; 32], 2, &pks)
-            .unwrap();
-        let tx = UnsignedTransaction::from_utx0(&payload, vec![r]).unwrap();
-        let ser = tx.serialize();
-        let mut want = double_sha256(&ser);
-        want.reverse();
-        assert_eq!(tx.txid(), want);
-    }
 }
