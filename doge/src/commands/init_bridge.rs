@@ -10,6 +10,9 @@ use doge_bridge_client::{
 use psy_doge_solana_core::instructions::doge_bridge::{
     InitializeBridgeInstructionDataDoge, InitializeBridgeParams,
 };
+use psy_doge_bridge_helper::tx_template::{
+    CustodyScriptConfig, ManagerCustodyProfile, OfficialTestnetManagerCustody,
+};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -25,17 +28,17 @@ use spl_associated_token_account::{
 use std::path::PathBuf;
 use std::str::FromStr;
 
-const DEFAULT_DOGE_BRIDGE: &str = "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ";
-const DEFAULT_PENDING_MINT: &str = "PMUSqycT1j5JTLmHk8frGSCido2h9VG1pyh2MPEa33o";
-const DEFAULT_TXO_BUFFER: &str = "TXWhjswto9q6hfaGPuAhDS79wAHKfbMJLVR178xYAaQ";
-const DEFAULT_GENERIC_BUFFER: &str = "GBYLmevzPSBPWfWrJ1h9gNzHqUjDXETzHKL1AasLyKwC";
-const DEFAULT_MANUAL_CLAIM: &str = "MCdYbqiK3uj36tohbMjsh3Ssg8iRSJmSHToNxW8TWWE";
-const OFFICIAL_MANAGER_SET_1_HASH: [u8; 32] = [
-    0x95, 0x44, 0xa9, 0x2b, 0xf6, 0x4e, 0x2e, 0x89,
-    0xf3, 0x3a, 0x05, 0xcd, 0x95, 0x1e, 0xce, 0xf2,
-    0x42, 0xdb, 0xfa, 0x08, 0xf7, 0x59, 0xd7, 0xb5,
-    0x95, 0x20, 0xc0, 0x92, 0x79, 0x6c, 0xa5, 0x18,
-];
+const DEFAULT_DOGE_BRIDGE: &str = "9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN";
+const DEFAULT_PENDING_MINT: &str = "DHB58D8HbnRM7QQiJ37iE3YjCfUbzbhpcc2Bf5rAXkua";
+const DEFAULT_TXO_BUFFER: &str = "9N217cCfEhickevyD3amY1BQh8P8Hay7CKKWa5kgrgHs";
+const DEFAULT_GENERIC_BUFFER: &str = "marxYjRRhMAmfyGPNwkKEgwzKsSNfmKQ4gzMLadZxuz";
+const DEFAULT_MANUAL_CLAIM: &str = "BsMpUmLvjjkvgrmQWJeaitmbQx1L5uXi5woXBbuDyUBJ";
+// The expected devnet custodian wallet config hash is derived dynamically from
+// the current doge-bridge program Bridge State PDA, the official Wormhole
+// Testnet Manager set 1 keys, config_id 1, and network_type 0 via
+// `CustodyScriptConfig::hash::<OfficialTestnetManagerCustody>`. The PDA is not
+// pinned to a retired deployment, so a fresh program identity derives the
+// canonical profile hash for its own Bridge State PDA.
 
 #[derive(Debug, Parser)]
 #[command(
@@ -124,6 +127,7 @@ fn bridge_state_pda(program_id: Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"bridge_state"], &program_id).0
 }
 
+
 fn default_initialize_params() -> InitializeBridgeParams {
     InitializeBridgeParams {
         bridge_header: PsyBridgeHeader::default(),
@@ -154,14 +158,33 @@ fn initialize_params(args: &Args) -> Result<InitializeBridgeParams> {
                     path.display()
                 )
             })?;
-        if matches!(args.runtime_network, RuntimeNetwork::Devnet)
-            && data.custodian_wallet_config_hash != OFFICIAL_MANAGER_SET_1_HASH
-        {
-            bail!(
-                "--network devnet requires official Dogecoin Manager set 1 config hash {}; got {}",
-                hex::encode(OFFICIAL_MANAGER_SET_1_HASH),
-                hex::encode(data.custodian_wallet_config_hash),
-            );
+        if matches!(args.runtime_network, RuntimeNetwork::Devnet) {
+            // Validate the supplied config hash against the canonical hash
+            // derived from the *current* doge-bridge Bridge State PDA and the
+            // official Wormhole Testnet Manager set 1 (config_id 1,
+            // network_type 0). The manager keys come from the compile-time
+            // OfficialTestnetManagerCustody profile; we additionally cross-check
+            // those profile keys against the deployed set bytes so a profile
+            // drift is caught before public initialization.
+            let emitter = bridge_state_pda(args.doge_bridge_program);
+            let manager_set = crate::wormhole::manager::official_testnet_manager_set_1()
+                .context("parse official testnet manager set 1")?;
+            let custody_config = CustodyScriptConfig::try_from_manager_set::<OfficialTestnetManagerCustody>(
+                emitter.to_bytes(),
+                manager_set.m,
+                &manager_set.pubkeys,
+                OfficialTestnetManagerCustody::CONFIG_ID,
+            )
+            .context("official testnet manager set 1 does not match the custody profile")?;
+            let expected = custody_config.hash::<OfficialTestnetManagerCustody>();
+            if data.custodian_wallet_config_hash != expected {
+                bail!(
+                    "--network devnet requires official Dogecoin Manager set 1 config hash {} for bridge PDA {}; got {}",
+                    hex::encode(expected),
+                    emitter,
+                    hex::encode(data.custodian_wallet_config_hash),
+                );
+            }
         }
         return Ok(InitializeBridgeParams {
             bridge_header: data.bridge_header,

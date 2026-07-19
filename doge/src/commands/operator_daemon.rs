@@ -20,7 +20,7 @@ use tokio::time::sleep;
 
 use crate::network::{fill_string, fill_string_optional, fill_u32, RuntimeNetwork};
 
-const DEFAULT_DOGE_BRIDGE: &str = "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ";
+const DEFAULT_DOGE_BRIDGE: &str = "9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN";
 
 #[derive(Debug, Parser)]
 #[command(

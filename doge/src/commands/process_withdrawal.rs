@@ -59,10 +59,10 @@ use crate::wormhole::{
 use crate::{custody_ops, plan_custody_transaction, CustodyTransactionPlan};
 use crate::network::{fill_string, fill_string_optional, fill_u32, DogeNetwork, RuntimeNetwork};
 
-const DEFAULT_DOGE_BRIDGE: &str = "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ";
-const DEFAULT_PENDING_MINT: &str = "PMUSqycT1j5JTLmHk8frGSCido2h9VG1pyh2MPEa33o";
-const DEFAULT_TXO_BUFFER: &str = "TXWhjswto9q6hfaGPuAhDS79wAHKfbMJLVR178xYAaQ";
-const DEFAULT_GENERIC_BUFFER: &str = "GBYLmevzPSBPWfWrJ1h9gNzHqUjDXETzHKL1AasLyKwC";
+const DEFAULT_DOGE_BRIDGE: &str = "9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN";
+const DEFAULT_PENDING_MINT: &str = "DHB58D8HbnRM7QQiJ37iE3YjCfUbzbhpcc2Bf5rAXkua";
+const DEFAULT_TXO_BUFFER: &str = "9N217cCfEhickevyD3amY1BQh8P8Hay7CKKWa5kgrgHs";
+const DEFAULT_GENERIC_BUFFER: &str = "marxYjRRhMAmfyGPNwkKEgwzKsSNfmKQ4gzMLadZxuz";
 const DELEGATED_MANAGER_SET_PROGRAM_ID: &str = "wdmsTJP6YnsfeQjPuuEzGCrHmZvTmNy8VkxMCK8JkBX";
 const GENERIC_BUFFER_HEADER_SIZE: usize = 32;
 const GENERIC_BUFFER_CHUNK_SIZE: usize = 878;

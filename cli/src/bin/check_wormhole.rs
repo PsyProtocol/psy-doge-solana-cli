@@ -9,7 +9,7 @@ fn main() {
     let rpc = RpcClient::new(args.get(1).cloned().unwrap_or("https://api.devnet.solana.com".into()));
     let core = Pubkey::from_str_const("3u8hJUVTA4jH1wYAyUur7FFZVQ8H635K3tSHHF4ssjQ5");
     let shim = Pubkey::from_str_const("EtZMZM22ViKMo4r5y4Anovs3wKQ2owUmDpjygnMMcdEX");
-    let emitter = Pubkey::from_str_const("9vzbk8X27e6VRcCPWCyxZsa2DV6GLQ3y9e1mXzfAgUdX");
+    let emitter = Pubkey::from_str_const("HATWnTqCHP3ZnDstJcw9jmeJ5zdjxpUParDGh5Sfonen");
 
     let (bc, _) = Pubkey::find_program_address(&[b"Bridge"], &core);
     let (gs, _) = Pubkey::find_program_address(&[b"guardian_set", &[0u8,0,0,0]], &core);

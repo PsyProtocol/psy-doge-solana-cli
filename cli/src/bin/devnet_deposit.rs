@@ -28,11 +28,11 @@ fn main() {
 
     let rpc = RpcClient::new(&rpc_url);
 
-    let program_id = Pubkey::from_str_const("DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ");
-    let pending_mint_id = Pubkey::from_str_const("PMUSqycT1j5JTLmHk8frGSCido2h9VG1pyh2MPEa33o");
-    let txo_buffer_id = Pubkey::from_str_const("TXWhjswto9q6hfaGPuAhDS79wAHKfbMJLVR178xYAaQ");
+    let program_id = Pubkey::from_str_const("9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN");
+    let pending_mint_id = Pubkey::from_str_const("DHB58D8HbnRM7QQiJ37iE3YjCfUbzbhpcc2Bf5rAXkua");
+    let txo_buffer_id = Pubkey::from_str_const("9N217cCfEhickevyD3amY1BQh8P8Hay7CKKWa5kgrgHs");
     // pDOGE mint from initialization
-    let doge_mint = Pubkey::from_str_const("BSeubjhLxFwjb4pcoE5X67aZfQuznzcbRfxvcHtUsziA");
+    let doge_mint = Pubkey::from_str_const("2nNioXNrhdrMkbTBaqp21mmaKDVtiooSyHapdMcoJNKN");
 
     let operator_bytes = operator.pubkey().to_bytes();
     let (bridge_state, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);

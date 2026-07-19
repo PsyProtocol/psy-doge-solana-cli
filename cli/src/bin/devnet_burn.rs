@@ -21,8 +21,8 @@ fn main() {
     println!("Operator: {}", operator.pubkey());
 
     let rpc = RpcClient::new(&rpc_url);
-    let program_id = Pubkey::from_str_const("DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ");
-    let doge_mint = Pubkey::from_str_const("BSeubjhLxFwjb4pcoE5X67aZfQuznzcbRfxvcHtUsziA");
+    let program_id = Pubkey::from_str_const("9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN");
+    let doge_mint = Pubkey::from_str_const("2nNioXNrhdrMkbTBaqp21mmaKDVtiooSyHapdMcoJNKN");
     let user_ata = Pubkey::from_str_const("E2TK98AKb3AanyLmbJziK7pwx6vNfxX9UzAnf6oMmPUY");
 
     // Recipient: mzpA3kNXzAczvzWWwxXwF5AvoE3nUbaxGK (P2PKH, hash160 from scriptPubKey)

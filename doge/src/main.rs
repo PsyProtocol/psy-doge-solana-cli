@@ -33,8 +33,6 @@ enum Commands {
     Daemon(commands::operator_daemon::Args),
     /// Initialize bridge from Dogecoin chain data
     InitBridge(commands::init_bridge::Args),
-    /// Migrate the audited live Bridge State layout after a devnet upgrade
-    MigrateBridgeState(commands::migrate_bridge_state::Args),
     /// Run the complete local smoke flow (localhost only)
     LocalE2e(commands::local_e2e::Args),
     /// LOCALHOST ONLY: deterministic local Manager/VAA HTTP service
@@ -50,7 +48,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Withdraw(args) => args.apply_network_defaults(cli.network),
         Commands::Daemon(args) => args.apply_network_defaults(cli.network),
         Commands::InitBridge(args) => args.apply_network_defaults(cli.network),
-        Commands::MigrateBridgeState(args) => args.apply_network_defaults(cli.network),
         Commands::LocalE2e(_) => {}
         Commands::ManagerService(_) => {
             if !cli.network.is_localhost() {
@@ -67,7 +64,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Withdraw(args) => commands::process_withdrawal::run(args).await,
         Commands::Daemon(args) => commands::operator_daemon::run(args).await,
         Commands::InitBridge(args) => commands::init_bridge::run(args).await,
-        Commands::MigrateBridgeState(args) => commands::migrate_bridge_state::run(args).await,
         Commands::LocalE2e(args) => commands::local_e2e::run(cli.network, args).await,
         Commands::ManagerService(args) => commands::local_manager_service::run(args).await,
     }
@@ -105,23 +101,5 @@ mod tests {
         .unwrap();
         assert_eq!(cli.network, RuntimeNetwork::Localhost);
         assert!(matches!(cli.command, Commands::LocalE2e(_)));
-    }
-
-    #[test]
-    fn migration_command_requires_explicit_signing_keys() {
-        let cli = Cli::try_parse_from([
-            "doge-solana-cli",
-            "--network",
-            "devnet",
-            "migrate-bridge-state",
-            "--payer-keypair",
-            "payer.json",
-            "--operator-keypair",
-            "operator.json",
-            "--upgrade-authority-keypair",
-            "authority.json",
-        ])
-        .expect("parse migration command");
-        assert!(matches!(cli.command, Commands::MigrateBridgeState(_)));
     }
 }

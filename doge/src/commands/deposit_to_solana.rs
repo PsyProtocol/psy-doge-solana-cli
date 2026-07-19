@@ -16,6 +16,9 @@ use doge_bridge_client::operator_store::{CustodyUtxo, CustodyUtxoStatus, Operato
 use doge_bridge_client::{BridgeApi, BridgeClient, BridgeClientConfigBuilder};
 use crate::network::{fill_string, fill_u32, DogeNetwork, RuntimeNetwork};
 use crate::wormhole::{manager::manager_set_for_index, redeem::build_redeem_script};
+use psy_doge_bridge_helper::tx_template::{
+    LocalRegtestManagerCustody, ManagerCustodyProfile, OfficialTestnetManagerCustody,
+};
 use crate::{custody_ops, SATS_PER_DOGE};
 use reqwest::Client as HttpClient;
 use ripemd::{Digest as RipemdDigest, Ripemd160};
@@ -33,7 +36,7 @@ use std::{
 };
 use tokio::time::sleep;
 
-const DEFAULT_DOGE_BRIDGE: &str = "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ";
+const DEFAULT_DOGE_BRIDGE: &str = "9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN";
 const DEFAULT_CUSTODY_KEY_REFERENCE: &str = "bridge-custody-wallet#0";
 const DEFAULT_FEE_SATS: u64 = 1_000_000;
 const DOGE_DUST_LIMIT_SATS: u64 = SATS_PER_DOGE;
@@ -283,6 +286,15 @@ pub async fn run(args: Args) -> Result<()> {
         manager_set.m,
         &manager_set.pubkeys,
     )?;
+    // Bind the runtime-resolved manager set keys to the compile-time custody
+    // profile that the DLC helper, IBC, and on-chain doge-bridge use for script
+    // derivation. This guarantees the deposit redeem script is byte-identical to
+    // the custody script every other component reconstructs for this network.
+    match manager_set_index {
+        0 => assert_manager_set_matches_profile::<LocalRegtestManagerCustody>(&manager_set)?,
+        1 => assert_manager_set_matches_profile::<OfficialTestnetManagerCustody>(&manager_set)?,
+        other => bail!("unsupported manager set index {other}; custody profile keys are only pinned for indices 0 (local regtest) and 1 (official testnet)"),
+    }
     eprintln!(
         "P2SH custody deposit address: {deposit_address}\nredeem script ({} bytes): {}\nscript_hash: {}",
         redeem_script.len(),
@@ -730,6 +742,27 @@ fn p2sh_custody_address(
     )?;
     let script_hash: [u8; 20] = Ripemd160::digest(Sha256::digest(&redeem_script)).into();
     Ok((network.encode_address(1, script_hash)?, script_hash))
+}
+/// Assert the runtime-resolved manager set keys equal the compile-time custody
+/// profile keys, so the deposit redeem script is byte-identical to the custody
+/// script the DLC helper / IBC / on-chain doge-bridge reconstruct.
+fn assert_manager_set_matches_profile<P: ManagerCustodyProfile>(
+    manager_set: &crate::wormhole::manager::ManagerSet,
+) -> Result<()> {
+    if manager_set.m != P::THRESHOLD {
+        bail!(
+            "manager set threshold {} does not match custody profile threshold {}",
+            manager_set.m,
+            P::THRESHOLD
+        );
+    }
+    if manager_set.pubkeys != P::PUBLIC_KEYS {
+        bail!(
+            "manager set index keys do not match the {:?} custody profile; deposit script would diverge from the canonical custody script",
+            std::any::type_name::<P>()
+        );
+    }
+    Ok(())
 }
 
 fn read_keypair(path: &Path, role: &str) -> Result<Keypair> {

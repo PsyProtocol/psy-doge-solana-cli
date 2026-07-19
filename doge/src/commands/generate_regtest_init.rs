@@ -9,7 +9,7 @@ use doge_light_client::{
 use psy_bridge_core::header::{
     PsyBridgeHeader, PsyBridgeStateCommitment, PsyBridgeTipStateCommitment,
 };
-use psy_doge_bridge_helper::tx_template::CustodyScriptConfig;
+use psy_doge_bridge_helper::tx_template::{CustodyScriptConfig, LocalRegtestManagerCustody};
 use psy_doge_data_link::link_sync::{
     block_header_cache::BlockHeaderFetcher, bridge_state_helpers::gen_bridge_initial_state,
     electrs_link::DogeLinkElectrsClient,
@@ -24,8 +24,6 @@ use serde::{Deserialize, Serialize};
 
 const HEADER_CACHE_SIZE: usize = 32;
 const BLOCK_TREE_HEIGHT: usize = 28;
-const EXPECTED_CUSTODIAN_HASH_HEX: &str =
-    "afae9579f67ecff79ea3297a58a4c814a4582020abd4e6d3f5e3b19b46f1ab69";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -94,15 +92,15 @@ pub fn run(args: Args) -> Result<()> {
     let expected_block_hash = normalize_hash(&args.expected_block_hash, "expected block hash")?;
     let custody_script_config =
         decode_fixed::<32>(&args.custody_script_config, "custody script config")?;
-    let custodian_wallet_config_hash = CustodyScriptConfig::new(custody_script_config).hash();
+    // Derive the custodian wallet config hash from the supplied emitter (the
+    // bridge-state PDA) and the local regtest custody profile (config_id 0,
+    // network_type 0). There is no fixed old-PDA hash assumption: the emitted
+    // hash is exactly `CustodyScriptConfig::hash::<LocalRegtestManagerCustody>`,
+    // byte-identical to the DLC helper, IBC, and on-chain doge-bridge for this
+    // PDA. The local E2E runner supplies the canonical local bridge PDA here.
+    let custodian_wallet_config_hash =
+        CustodyScriptConfig::new(custody_script_config).hash::<LocalRegtestManagerCustody>();
     let custodian_hash_hex = hex::encode(custodian_wallet_config_hash);
-    if custodian_hash_hex != EXPECTED_CUSTODIAN_HASH_HEX {
-        bail!(
-            "full manager custody config hashes to {}, expected canonical local bridge hash {}",
-            custodian_hash_hex,
-            EXPECTED_CUSTODIAN_HASH_HEX
-        );
-    }
 
     let template_text = fs::read_to_string(&args.template)
         .with_context(|| format!("read template {}", args.template.display()))?;

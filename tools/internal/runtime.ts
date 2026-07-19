@@ -121,7 +121,7 @@ const LOCAL_MANAGER_SET_BYTES = Buffer.concat([
     LOCAL_MANAGER_SET_PREFIX,
     ...LOCAL_MANAGER_SET_PUBKEYS.map((key) => Buffer.from(key, "hex")),
 ]);
-const BRIDGE_STATE_PDA = "9vzbk8X27e6VRcCPWCyxZsa2DV6GLQ3y9e1mXzfAgUdX";
+const BRIDGE_STATE_PDA = "HATWnTqCHP3ZnDstJcw9jmeJ5zdjxpUParDGh5Sfonen";
 const PUBLIC_WORMHOLE_DEVNET_CORE_ID = "3u8hJUVTA4jH1wYAyUur7FFZVQ8H635K3tSHHF4ssjQ5";
 const PUBLIC_WORMHOLE_DEVNET_SHIM_ID = "EtZMZM22ViKMo4r5y4Anovs3wKQ2owUmDpjygnMMcdEX";
 const SOLANA_GENESIS_HASHES = {
@@ -130,11 +130,11 @@ const SOLANA_GENESIS_HASHES = {
 const UPGRADEABLE_LOADER_ID = "BPFLoaderUpgradeab1e11111111111111111111111";
 const PUBLIC_PROGRAM_NAMES = ["doge-bridge", "pending-mint-buffer", "txo-buffer", "generic-buffer", "manual-claim"] as const;
 const PUBLIC_PROGRAM_IDS: Record<(typeof PUBLIC_PROGRAM_NAMES)[number], string> = {
-    "doge-bridge": "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ",
-    "pending-mint-buffer": "PMUSqycT1j5JTLmHk8frGSCido2h9VG1pyh2MPEa33o",
-    "txo-buffer": "TXWhjswto9q6hfaGPuAhDS79wAHKfbMJLVR178xYAaQ",
-    "generic-buffer": "GBYLmevzPSBPWfWrJ1h9gNzHqUjDXETzHKL1AasLyKwC",
-    "manual-claim": "MCdYbqiK3uj36tohbMjsh3Ssg8iRSJmSHToNxW8TWWE",
+    "doge-bridge": "9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN",
+    "pending-mint-buffer": "DHB58D8HbnRM7QQiJ37iE3YjCfUbzbhpcc2Bf5rAXkua",
+    "txo-buffer": "9N217cCfEhickevyD3amY1BQh8P8Hay7CKKWa5kgrgHs",
+    "generic-buffer": "marxYjRRhMAmfyGPNwkKEgwzKsSNfmKQ4gzMLadZxuz",
+    "manual-claim": "BsMpUmLvjjkvgrmQWJeaitmbQx1L5uXi5woXBbuDyUBJ",
 };
 
 const LOCAL_SMOKE_FUNDING_SCHEMA = "psy-doge-local-smoke-funding-v1";
@@ -1938,7 +1938,7 @@ class Launcher {
         const blockElfPath = process.env.SP1_BLOCK_ELF_PATH
             || path.join(this.options.sp1Repo, "target/elf-compilation/riscv64im-succinct-zkvm-elf/release/block-transition");
         const expectedVk = process.env.SP1_BLOCK_VK_HASH
-            || "002ed3c169b6415db45e569dd01675bfb2ba89c59c7d26582f3a22d2ec313ee8";
+            || "001fa018c35d88136afe0e92bc9afe33ba94ca5dcd9156147adf004c7810e199";
         const command = [
             "cargo", "run", "--release", "-p", "qed_dsol_ibc_node_common",
             "--example", "e2e_block_pipeline", "--",

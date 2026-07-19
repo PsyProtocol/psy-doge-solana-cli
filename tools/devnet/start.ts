@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import { parseArgs } from "node:util";
+import { createHash } from "node:crypto";
 import { Keypair, PublicKey } from "@solana/web3.js";
 
 const CLI_REPO = path.resolve(import.meta.dir, "../..");
@@ -16,11 +17,11 @@ const DEFAULT_ELECTRS_URL = "https://doge-electrs-testnet-demo.qed.me";
 const DEFAULT_MANAGER_URL = "https://api.testnet.wormholescan.io";
 const DEFAULT_STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "psy-doge-devnet");
 const DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
-const DOGE_BRIDGE_PROGRAM = "DBjo5tqf2uwt4sg9JznSk9SBbEvsLixknN58y3trwCxJ";
-const PENDING_MINT_PROGRAM = "PMUSqycT1j5JTLmHk8frGSCido2h9VG1pyh2MPEa33o";
-const TXO_BUFFER_PROGRAM = "TXWhjswto9q6hfaGPuAhDS79wAHKfbMJLVR178xYAaQ";
-const GENERIC_BUFFER_PROGRAM = "GBYLmevzPSBPWfWrJ1h9gNzHqUjDXETzHKL1AasLyKwC";
-const MANUAL_CLAIM_PROGRAM = "MCdYbqiK3uj36tohbMjsh3Ssg8iRSJmSHToNxW8TWWE";
+const DOGE_BRIDGE_PROGRAM = "9HdfoY6yYFLo3sQ5qMv9tHHgXzB3AnA2GXXyedeWrLdN";
+const PENDING_MINT_PROGRAM = "DHB58D8HbnRM7QQiJ37iE3YjCfUbzbhpcc2Bf5rAXkua";
+const TXO_BUFFER_PROGRAM = "9N217cCfEhickevyD3amY1BQh8P8Hay7CKKWa5kgrgHs";
+const GENERIC_BUFFER_PROGRAM = "marxYjRRhMAmfyGPNwkKEgwzKsSNfmKQ4gzMLadZxuz";
+const MANUAL_CLAIM_PROGRAM = "BsMpUmLvjjkvgrmQWJeaitmbQx1L5uXi5woXBbuDyUBJ";
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const OFFICIAL_WORMHOLE_CORE = "3u8hJUVTA4jH1wYAyUur7FFZVQ8H635K3tSHHF4ssjQ5";
 const OFFICIAL_WORMHOLE_SHIM = "EtZMZM22ViKMo4r5y4Anovs3wKQ2owUmDpjygnMMcdEX";
@@ -38,9 +39,8 @@ const EXPECTED_MANAGER_SET_BYTES = Buffer.from(
     + "037ff483369b52bd87a73f23413dd8fcace71de7f7823c5c9120f1e9cfe5733a88",
     "hex",
 );
-const OFFICIAL_MANAGER_SET_HASH = Buffer.from("9544a92bf64e2e89f33a05cd951ecef242dbfa08f759d7b59520c092796ca518", "hex");
-const TESTNET_BLOCK_VK = "006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd";
-const BRIDGE_STATE_PDA = "9vzbk8X27e6VRcCPWCyxZsa2DV6GLQ3y9e1mXzfAgUdX";
+const TESTNET_BLOCK_VK = "00b25e2fe5866751a38e5ca4d975b30b4187f3e0528a06dc86edc6e9a8b9cc02";
+const BRIDGE_STATE_PDA = "HATWnTqCHP3ZnDstJcw9jmeJ5zdjxpUParDGh5Sfonen";
 const BRIDGE_STATE_SIZE = 6_224;
 const HEADER_SIZE = 320;
 const FINALIZED_HEIGHT_OFFSET = 268;
@@ -50,6 +50,37 @@ const CONFIG_SIZE = 48;
 const OPERATOR_OFFSET = 6_128;
 const MINT_OFFSET = 6_192;
 const MINT_SIZE = 32;
+/// Derive the official Manager set 1 custodian wallet config hash from the
+/// current Bridge State PDA + the deployed Manager set bytes (Type|M|N|keys)
+/// using the exact 264-byte custody wallet config layout, and assert it equals
+/// the canonical hash for this deployment. The PDA is the custody-script
+/// emitter; the manager keys + threshold come from EXPECTED_MANAGER_SET_BYTES;
+/// config_id is 1 and network_type is 0 for official testnet set 1. This stays
+/// byte-identical to the DLC helper, CLI, IBC, and on-chain doge-bridge.
+function custodyWalletConfigHash(emitterHex: string, managerSetBytes: Buffer, configId: number, networkType: number): Buffer {
+    // managerSetBytes layout: Type(1) | M(1) | N(1) | Pubkeys(N*33)
+    const n = managerSetBytes[2];
+    if (managerSetBytes.length < 3 + n * 33) fail("EXPECTED_MANAGER_SET_BYTES is truncated");
+    // 32 emitter + 7*32 x-only keys + 4 config_id + 2 y_parity + 2 network_type
+    const walletConfig = Buffer.alloc(264);
+    Buffer.from(emitterHex, "hex").copy(walletConfig, 0);
+    let yParity = 0;
+    for (let i = 0; i < n; i++) {
+        const compressed = managerSetBytes.subarray(3 + i * 33, 3 + (i + 1) * 33);
+        if (compressed.length !== 33) fail(`manager set key ${i} is not 33 bytes`);
+        compressed.copy(walletConfig, 32 + i * 32, 1, 33); // x-only (drop parity byte)
+        if (compressed[0] === 0x03) yParity |= 1 << i;
+    }
+    walletConfig.writeUInt32LE(configId, 256);
+    walletConfig.writeUInt16LE(yParity, 260);
+    walletConfig.writeUInt16LE(networkType, 262);
+    return createHash("sha256").update(walletConfig).digest();
+}
+const EXPECTED_OFFICIAL_CUSTODY_HASH_HEX = "2621f9ac4de46226f85b48bcf2e20c87e6bb62ff946a9b12becb8c35a4e90ab0";
+const OFFICIAL_CUSTODY_HASH = custodyWalletConfigHash(pubkeyHex(BRIDGE_STATE_PDA), EXPECTED_MANAGER_SET_BYTES, 1, 0);
+if (OFFICIAL_CUSTODY_HASH.toString("hex") !== EXPECTED_OFFICIAL_CUSTODY_HASH_HEX) {
+    fail(`derived official custody hash ${OFFICIAL_CUSTODY_HASH.toString("hex")} does not match canonical ${EXPECTED_OFFICIAL_CUSTODY_HASH_HEX} for Bridge State PDA ${BRIDGE_STATE_PDA}`);
+}
 
 export type ProcessRole = "sender" | "ibc" | "daemon";
 export type ProcessSpec = { role: ProcessRole; command: string[]; cwd: string; env?: Record<string, string> };
@@ -351,7 +382,7 @@ async function preflight(options: SupervisorOptions): Promise<RuntimeInputs> {
     const managerSet = decodeAccount(managerSetResult, MANAGER_SET_PDA);
     if (managerSet.length < 18 + EXPECTED_MANAGER_SET_BYTES.length || !managerSet.subarray(18, 18 + EXPECTED_MANAGER_SET_BYTES.length).equals(EXPECTED_MANAGER_SET_BYTES)) fail("Dogecoin Manager set 1 bytes mismatch");
     const custodianHash = bridgeState.subarray(CUSTODIAN_HASH_OFFSET, CUSTODIAN_HASH_OFFSET + 32);
-    if (!custodianHash.equals(OFFICIAL_MANAGER_SET_HASH)) fail(`Bridge custodian hash ${custodianHash.toString("hex")} does not match official Manager set 1`);
+    if (!custodianHash.equals(OFFICIAL_CUSTODY_HASH)) fail(`Bridge custodian hash ${custodianHash.toString("hex")} does not match official Manager set 1 custody hash ${OFFICIAL_CUSTODY_HASH.toString("hex")} for Bridge State PDA ${BRIDGE_STATE_PDA}`);
     const stateOperator = new PublicKey(bridgeState.subarray(OPERATOR_OFFSET, OPERATOR_OFFSET + 32)).toBase58();
     if (stateOperator !== operator.pubkey) fail(`Operator keypair ${operator.pubkey} does not match Bridge State operator ${stateOperator}`);
     const stateMint = new PublicKey(bridgeState.subarray(MINT_OFFSET, MINT_OFFSET + MINT_SIZE)).toBase58();
@@ -384,7 +415,7 @@ async function preflight(options: SupervisorOptions): Promise<RuntimeInputs> {
     const configParams = bridgeState.subarray(CONFIG_OFFSET, CONFIG_OFFSET + CONFIG_SIZE).toString("hex");
     const initialHeader = bridgeState.subarray(0, HEADER_SIZE).toString("hex");
     console.log(`[preflight] devnet genesis=${genesis} Electrs tip=${electrsTip} start=${startHeight}`);
-    console.log(`[preflight] programs=DBjo/PMUS/TXWh/GBYL/MCdY Core=${OFFICIAL_WORMHOLE_CORE} Shim=${OFFICIAL_WORMHOLE_SHIM}`);
+    console.log(`[preflight] programs=${DOGE_BRIDGE_PROGRAM}/${PENDING_MINT_PROGRAM}/${TXO_BUFFER_PROGRAM}/${GENERIC_BUFFER_PROGRAM}/${MANUAL_CLAIM_PROGRAM} Core=${OFFICIAL_WORMHOLE_CORE} Shim=${OFFICIAL_WORMHOLE_SHIM}`);
     console.log(`[preflight] Manager chain=65 set=1 operator=${operator.pubkey} payer=${payer.pubkey}`);
     return { senderToken, redisPassword, operatorSeed: operator.seedHex, payerSeed: payer.seedHex, initialHeader, configParams, startHeight };
 }

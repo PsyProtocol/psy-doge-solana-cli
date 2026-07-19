@@ -147,22 +147,9 @@ bun tools/deploy/devnet.ts --network devnet \
   --preflight
 ```
 
-After upgrading the five Psy programs, execute the authenticated Bridge State
-migration from the historical `6,264`-byte layout to the current `6,224`-byte
-snapshot layout. Do not start workers until migration verification passes.
-
-```bash
-doge/target/release/doge-solana-cli --network devnet migrate-bridge-state \
-  --payer-keypair /secure/payer.json \
-  --operator-keypair /secure/operator.json \
-  --upgrade-authority-keypair /secure/upgrade-authority.json
-```
-
-The command requires payer, the existing Bridge State operator, and the current
-ProgramData upgrade authority to sign. The on-chain migration also pins the
-exact audited live-state SHA-256 and official Manager set-1 hash; it preserves
-the checkpoint, mint, fee/accounting fields, and access control while retiring
-only the obsolete processed cursor and active withdrawal intent.
+After deploying the five Psy programs, initialize the Bridge State directly with
+`init-bridge`. Fresh deployments use the current `6,224`-byte snapshot layout;
+no layout migration step is required.
 
 The production Manager URL is an external prerequisite, not Wormholescan's
 standard Guardian VAA endpoint. It must implement both Manager transaction
@@ -189,8 +176,7 @@ Remove `--preflight` to run. The supervisor verifies devnet genesis, five
 required program accounts, official Core/Shim, Dogecoin Manager chain `65` set
 `1`, Electrs, authenticated Redis, a parseable Manager-signature route,
 executable release artifacts, key-file modes, operator/mint/ATA bindings, and
-the exact Bridge State layout before starting anything. It refuses the current
-historical live `6,264`-byte state until the authenticated migration has run.
+the exact Bridge State layout before starting anything.
 Ctrl+C/SIGTERM stops daemon, IBC/SP1, and Sender in reverse order.
 
 ## Sibling runtime dependencies
